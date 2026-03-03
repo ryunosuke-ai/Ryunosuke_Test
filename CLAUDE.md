@@ -11,8 +11,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## 作業ルール
 - 作業を開始する前に、gitが初期化されていない場合は `git init` を実行すること
 - その後、必ず以下を順番に実行すること
-  1. `git add -A && git commit -m "before claude edit"`
+  1. 変更内容を表すコミットメッセージで `git add -A && git commit` を実行すること
   2. `git push origin master`
+- コミットメッセージは以下の形式に従うこと：
+  - `feat: ○○機能を追加` — 新機能
+  - `fix: ○○のバグを修正` — バグ修正
+  - `refactor: ○○をリファクタリング` — 動作変更なしのコード整理
+  - `docs: ○○のドキュメントを更新` — ドキュメントのみの変更
+  - `chore: ○○` — ビルド・設定ファイル等の雑務
 - リモート: https://github.com/ryunosuke-ai/Ryunosuke_Test.git
 
 ## 起動方法
