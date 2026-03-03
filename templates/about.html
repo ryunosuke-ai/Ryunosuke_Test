@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>About - 簡単なWebサイト</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header>
+    <h1>About</h1>
+  </header>
+  <main>
+    <p>このサイトはFlaskのサンプルです。</p>
+    <p><a href="{{ url_for('index') }}">ホームに戻る</a></p>
+  </main>
+  <footer>
+    <small>© 2026</small>
+  </footer>
+</body>
+</html>

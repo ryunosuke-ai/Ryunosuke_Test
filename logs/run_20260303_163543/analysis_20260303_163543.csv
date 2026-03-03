@@ -1,0 +1,5 @@
+Timestamp,Turn,Phase,Speaker,ActionType,P_WantTalk,Text
+16:35:50,0,SETUP,AI,,0.50,"こんにちは。たくさんお話しできたら嬉しいです！"
+16:35:56,1,SETUP,User,NORMAL,0.33,"こんにちは。"
+16:36:03,1,INTRO,AI,,0.33,"こんにちは！今日はどんな感じで過ごしているんですか？"
+16:36:08,2,INTRO,User,SILENCE,0.10,"(沈黙)"

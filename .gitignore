@@ -1,0 +1,12 @@
+# 機密情報
+.env
+
+# Python
+__pycache__/
+*.pyc
+
+# フラグファイル
+ui_ready.flag
+
+# テスト環境
+test_env/
