@@ -7,4 +7,8 @@
 - ドキュメントも日本語で生成する
 
 ## 作業ルール
-- 作業を開始する前に必ず `git add -A && git commit -m "before claude edit"` を実行すること
+- 作業を開始する前に、gitが初期化されていない場合は `git init` を実行すること
+- その後、必ず以下を順番に実行すること
+  1. `git add -A && git commit -m "before claude edit"`
+  2. `git push origin master`
+- リモート: https://github.com/ryunosuke-ai/Ryunosuke_Test.git
