@@ -432,6 +432,12 @@ class MultimodalAgent:
         self._banner("会話ロボット")
 
         ui_flag = "ui_ready.flag"
+        # 前回セッションの残存フラグを削除し、新しいUI起動を確実に待つ
+        if os.path.exists(ui_flag):
+            try:
+                os.remove(ui_flag)
+            except OSError:
+                pass
         print("⏳ UI起動待機中... (streamlit run ui_display.py を実行してください)")
         while not os.path.exists(ui_flag):
             time.sleep(0.5)
