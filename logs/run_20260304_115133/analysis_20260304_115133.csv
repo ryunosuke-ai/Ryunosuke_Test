@@ -1,0 +1,7 @@
+Timestamp,Turn,Phase,Speaker,ActionType,P_WantTalk,Text
+11:51:45,0,SETUP,AI,,0.50,"こんにちは。たくさんお話しできたら嬉しいです！"
+11:51:51,1,SETUP,User,NORMAL,0.33,"こんにちは。"
+11:51:57,1,INTRO,AI,,0.33,"こんにちは！今日はどんな気分ですか？"
+11:52:06,2,INTRO,User,NORMAL,0.20,"うん。まあ普通の気分かな。"
+11:52:21,2,SURROUNDINGS,AI,,0.20,"カウンターに集まる人たちが描かれていますね。フード付きのシャツを着た男性とパイプを持っている男性が話しているようですが、なぜだと思いますか？"
+11:52:29,3,SURROUNDINGS,User,NORMAL,0.11,"でね。"
