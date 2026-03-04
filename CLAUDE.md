@@ -60,7 +60,11 @@ AZURE_OPENAI_API_VERSION=
 
 | ファイル | 役割 |
 |---|---|
-| `bayes_v3.py` | **現行メインエージェント**。ベイズ更新・フェーズ管理・会話メモを統合 |
+| `bayes_v3.py` | **エントリーポイント兼オーケストレータ**。MultimodalAgent: init, speak, listen, ログ, think_and_reply, run |
+| `models.py` | データ構造定義（ActionType, Phase, PhaseConfig, Observation, MemoryUpdate） |
+| `bayes_engine.py` | ベイズ更新 + 観測分類（update_posterior, is_minimal_reply, classify_action, judge_memory_and_disclosure） |
+| `phase_manager.py` | フェーズ遷移ポリシー + 設定テーブル + インタラクションモード指示 |
+| `conv_memory.py` | 会話メモ更新 + 終了意思検出 |
 | `ui_display.py` | **メインUI**。Streamlitでログをリアルタイム表示 |
 | `omomi_score.py` | `bayes_v3.py` の前身（重み係数ベースの更新、カメラ使用） |
 | `enshutu_main.py` | フェーズ管理の初期実装（カメラ使用） |
@@ -69,18 +73,31 @@ AZURE_OPENAI_API_VERSION=
 | `app.py` | バックグラウンドスレッドでエージェントを動かす別UI |
 | `STT.py`, `LLM.py`, `Vision.py` | 各機能の単体テスト用スクリプト |
 
+### モジュール依存関係（循環参照なし）
+
+```
+models.py  ← 全モジュールが依存（一方向のみ）
+  ↑  ↑  ↑
+  |  |  └── conv_memory.py
+  |  └───── phase_manager.py
+  └──────── bayes_engine.py
+                ↑
+bayes_v3.py ----+--→ phase_manager.py
+                └--→ conv_memory.py
+```
+
 ### `bayes_v3.py` の内部構造
 
 #### 会話フェーズ（Phase）
 `SETUP → INTRO → SURROUNDINGS → BRIDGE → DEEP_DIVE → ENDING` の順で進む。`SURROUNDINGS` と `BRIDGE` のみ画像を使用。BRIDGEは回想が引き出せなければ `SURROUNDINGS` に戻る。
 
-#### ベイズ更新（`update_posterior`）
+#### ベイズ更新（`bayes_engine.update_posterior`）
 - `p_want_talk`（0〜1）でユーザーの「話したい度」を管理
 - `ActionType`: SILENCE / NORMAL / DISCLOSURE の3クラス
 - H1（話したい）とH0（話したくない）の尤度テーブルを使い正規化更新
 - 生返事（`minimal_reply`）は専用の尤度で強めに下げる
 
-#### 会話メモ（`conv_memory: MemoryUpdate`）
+#### 会話メモ（`conv_memory.update_conv_memory`）
 - `summary`: これまでの会話の要約（LLMで更新）
 - `do_not_ask`: 繰り返し質問禁止リスト（最大8件）
 - `stop_intent`: ユーザーの終了意思フラグ
