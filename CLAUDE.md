@@ -35,6 +35,21 @@ python bayes_v3.py
 
 `bayes_v3.py` は `ui_ready.flag` ファイルが作成されるまで待機する。このフラグは `ui_display.py` が起動時に作成する。
 
+## テスト
+
+```bash
+# 全テスト実行（60件）
+python -m pytest test_bayes_v3.py test_ui_display.py -v
+
+# 単一テストクラス
+python -m pytest test_bayes_v3.py::TestUpdatePosterior -v
+
+# 単一テストメソッド
+python -m pytest test_bayes_v3.py::TestUpdatePosterior::test_disclosure_raises_probability -v
+```
+
+テストは Azure Speech SDK / cv2 / OpenAI API をすべてモック化しており、APIキーやネットワーク接続なしで実行可能。テンポラリディレクトリを使用するためクリーンアップ不要。
+
 ## 環境変数（.env）
 
 `.env` ファイルに以下が必要：
@@ -66,12 +81,8 @@ AZURE_OPENAI_API_VERSION=
 | `phase_manager.py` | フェーズ遷移ポリシー + 設定テーブル + インタラクションモード指示 |
 | `conv_memory.py` | 会話メモ更新 + 終了意思検出 |
 | `ui_display.py` | **メインUI**。Streamlitでログをリアルタイム表示 |
-| `omomi_score.py` | `bayes_v3.py` の前身（重み係数ベースの更新、カメラ使用） |
-| `enshutu_main.py` | フェーズ管理の初期実装（カメラ使用） |
-| `main.py` | 原型の単純なマルチモーダルエージェント（カメラ使用） |
-| `bayes_v3_4class.py` / `bayes_v3_4class_llm.py` | ActionTypeを4クラスに拡張した実験バリアント |
-| `app.py` | バックグラウンドスレッドでエージェントを動かす別UI |
-| `STT.py`, `LLM.py`, `Vision.py` | 各機能の単体テスト用スクリプト |
+| `test_bayes_v3.py` | bayes_v3 / bayes_engine / phase_manager / conv_memory のユニットテスト |
+| `test_ui_display.py` | ui_display のユニットテスト |
 
 ### モジュール依存関係（循環参照なし）
 
@@ -86,27 +97,17 @@ bayes_v3.py ----+--→ phase_manager.py
                 └--→ conv_memory.py
 ```
 
-### `bayes_v3.py` の内部構造
+### 会話フローの概要
 
-#### 会話フェーズ（Phase）
-`SETUP → INTRO → SURROUNDINGS → BRIDGE → DEEP_DIVE → ENDING` の順で進む。`SURROUNDINGS` と `BRIDGE` のみ画像を使用。BRIDGEは回想が引き出せなければ `SURROUNDINGS` に戻る。
+```
+listen() → classify_action() → update_posterior() → think_and_reply() → speak()
+               ↓                      ↓
+        ActionType判定           p_want_talk更新
+        (SILENCE/NORMAL/          ↓
+         DISCLOSURE)         phase_manager が
+                             フェーズ遷移を判定
+```
 
-#### ベイズ更新（`bayes_engine.update_posterior`）
-- `p_want_talk`（0〜1）でユーザーの「話したい度」を管理
-- `ActionType`: SILENCE / NORMAL / DISCLOSURE の3クラス
-- H1（話したい）とH0（話したくない）の尤度テーブルを使い正規化更新
-- 生返事（`minimal_reply`）は専用の尤度で強めに下げる
-
-#### 会話メモ（`conv_memory.update_conv_memory`）
-- `summary`: これまでの会話の要約（LLMで更新）
-- `do_not_ask`: 繰り返し質問禁止リスト（最大8件）
-- `stop_intent`: ユーザーの終了意思フラグ
-
-#### ログ出力
-実行ごとに `logs/run_YYYYMMDD_HHMMSS/` を作成：
-- `log_*.txt` — 会話ログ（`[HH:MM:SS] AI:` / `[HH:MM:SS] User:` 形式）
-- `analysis_*.csv` — ターンごとの分析データ（P_WantTalk, Phase, Turn 等）
-- `agent_*.log` — Pythonロギング出力
-
-#### `ui_display.py` との連携
-`bayes_v3.py` は起動時に `ui_ready.flag` の存在を0.5秒ごとにポーリングして待機。`ui_display.py` は起動時にこのフラグを作成し、エージェントに起動を通知する。UIは `analysis_*.csv` と `log_*.txt` を2秒ごとに再読み込みしてリアルタイム表示する。
+- フェーズ: `SETUP → INTRO → SURROUNDINGS → BRIDGE → DEEP_DIVE → ENDING`
+- ログ出力: 実行ごとに `logs/run_YYYYMMDD_HHMMSS/` へ会話ログ・分析CSV・agentログを保存
+- UI連携: `ui_ready.flag` で起動同期、UIは CSV/ログを2秒ごとにポーリング表示
