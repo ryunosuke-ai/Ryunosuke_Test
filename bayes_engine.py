@@ -123,7 +123,7 @@ DEFAULT_LIKELIHOODS: Dict[str, Dict[ActionType, float]] = {
 
 # 生返事に対する尤度（NORMAL を上書き）
 DEFAULT_MINIMAL_LIKELIHOOD: Dict[str, float] = {
-    "H1": 0.05,
+    "H1": 0.15,
     "H0": 0.70,
 }
 
