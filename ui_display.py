@@ -185,8 +185,8 @@ def read_conversation_log(log_path: str) -> list[dict]:
 PHASE_MAP = {
     "SETUP": "初期設定",
     "INTRO": "挨拶・アイスブレイク",
-    "SURROUNDINGS": "周囲の話題",
-    "BRIDGE": "連想（橋渡し）",
+    "SURROUNDINGS": "画像についての話題",
+    "BRIDGE": "連想",
     "DEEP_DIVE": "深掘り",
     "ENDING": "エンディング",
 }
