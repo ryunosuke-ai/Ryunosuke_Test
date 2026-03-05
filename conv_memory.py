@@ -99,7 +99,7 @@ def update_conv_memory(
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
             ],
-            max_tokens=260,
+            max_tokens=512,
             temperature=0,
         )
         text = (res.choices[0].message.content or "").strip()

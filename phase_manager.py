@@ -52,7 +52,7 @@ DEFAULT_PHASE_CONFIGS: Dict[Phase, PhaseConfig] = {
         require_image=True,
         max_turns=4,
         instruction=(
-            "連想（回想の点火）。\n"
+            "連想。\n"
             "・【重要】必ずユーザーの直前の言葉を受け止め、共感やリアクションを示してから次の話題へ繋ぐこと\n"
             "・周囲の要素→連想の足場→過去/好みへ\u201c自然に\u201dつなぐ\n"
             "・足場例：場所→季節→行事→食べ物→人（いきなり深い話は聞かない）\n"
