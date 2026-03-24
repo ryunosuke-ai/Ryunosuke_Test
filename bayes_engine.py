@@ -110,9 +110,9 @@ JUDGE_MEMORY_PROMPT = (
 # 尤度テーブル（デフォルト値）
 DEFAULT_LIKELIHOODS: Dict[str, Dict[ActionType, float]] = {
     "H1": {
-        ActionType.SILENCE: 0.10,
-        ActionType.NORMAL: 0.25,
-        ActionType.DISCLOSURE: 0.65,
+        ActionType.SILENCE: 0.20,
+        ActionType.NORMAL: 0.30,
+        ActionType.DISCLOSURE: 0.50,
     },
     "H0": {
         ActionType.SILENCE: 0.45,
