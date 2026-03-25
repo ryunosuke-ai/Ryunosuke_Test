@@ -264,7 +264,7 @@ class TextChatAgent:
 
         initial_question_instruction = ""
         if self.phase_mgr.phase == Phase.SURROUNDINGS and not self.asked_initial_image_question:
-            initial_question_instruction = "【重要】このターンの発言の最初 または 最後に、必ず「なぜフード付きのシャツを着た男性とパイプを持っている男性が話していると思いますか？」という趣旨の質問を組み込んでください。\n"
+            #initial_question_instruction = "【重要】このターンの発言の最初 または 最後に、必ず「なぜフード付きのシャツを着た男性とパイプを持っている男性が話していると思いますか？」という趣旨の質問を組み込んでください。\n"
             self.asked_initial_image_question = True
 
         interaction_mode = self.phase_mgr.get_interaction_mode_instruction(obs, self.p_want_talk)
@@ -412,6 +412,7 @@ class TextChatAgent:
                     img_b64 = self.static_image_b64
 
                 reply = self.think_and_reply(obs, img_b64)
+                self.phase_mgr.notify_reply(reply)
                 self.output(reply)
 
                 self.log_interaction("AI", reply, "")

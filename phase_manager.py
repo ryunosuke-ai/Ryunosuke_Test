@@ -39,11 +39,12 @@ DEFAULT_PHASE_CONFIGS: Dict[Phase, PhaseConfig] = {
         max_turns=3,
         instruction=(
             "画像についての話（共同注意）。\n"
-            "・【重要】まずは直前のユーザーの返答（近況や様子など）に対して、内容に踏み込んだ感想・共感を1〜2文で述べること（「なるほど」「そうなんですね」だけで済ませるのは禁止）\n"
-            "・話題を変える際は、必ず接続詞（「ところで」「そういえば」など）を入れてから画像の話に移る\n"
+            "・まずは直前のユーザーの返答に対して、返答内容に沿った感想・共感を簡単に述べること\n"
+            "・その後、画像についての話題に移る際には必ず接続詞（「ところで」「そういえば」など）を入れてから画像の話に移る\n"
             "・ユーザーが入りやすい余白を作る（間、共感、短い確認）\n"
+            "・画像の中から会話が盛り上がりそうな要素を取り出して質問を考えてください\n"
             "・質問するなら負担小：はい/いいえ、二択、指差しレベルの1問だけ\n"
-            "・会話メモにある内容（例：今日の予定）は繰り返し聞かず、言及する形でつなぐ\n"
+            "・会話メモにある内容は繰り返し聞かず、言及する形でつなぐ\n"
             "・反応が薄いなら、質問を減らしてコメント中心にする\n"
         ),
     ),
@@ -53,7 +54,7 @@ DEFAULT_PHASE_CONFIGS: Dict[Phase, PhaseConfig] = {
         max_turns=4,
         instruction=(
             "連想。\n"
-            "・【重要】必ずユーザーの直前の言葉を受け止め、共感やリアクションを示してから次の話題へ繋ぐこと\n"
+            "・直前のユーザーの返答に対して、返答内容に沿った共感やリアクションを示してから次の話題へ繋ぐこと\n"
             "・画像内の要素→連想の足場→過去/好みへ\u201c自然に\u201dつなぐ\n"
             "・足場例：場所→季節→行事→食べ物→人（いきなり深い話は聞かない）\n"
             "・回想/自己開示が出たら深掘りへ。出なければ周囲共有に戻ってよい\n"
@@ -107,6 +108,7 @@ class PhaseManager:
         self.consecutive_silence: int = 0
         self.bridge_fail_count: int = 0
         self.deep_drop_count: int = 0
+        self.consecutive_empathy_only: int = 0
 
     def transition_policy(self, obs: Observation, p_want_talk: float) -> None:
         """フェーズ遷移の核。p_want_talk は外部から受け取る。"""
@@ -177,6 +179,13 @@ class PhaseManager:
         # ENDING は維持
         return
 
+    def notify_reply(self, reply_text: str) -> None:
+        """AIの応答に質問が含まれているかを記録する。"""
+        if not reply_text or ("？" not in reply_text and "?" not in reply_text):
+            self.consecutive_empathy_only += 1
+        else:
+            self.consecutive_empathy_only = 0
+
     def get_interaction_mode_instruction(self, obs: Observation, p_want_talk: float) -> str:
         """質問をしすぎないためのモード指示を返す。"""
         if self.phase == Phase.ENDING:
@@ -197,10 +206,16 @@ class PhaseManager:
             )
 
         if p_want_talk >= 0.70:
+            if self.consecutive_empathy_only >= 1:
+                return (
+                    "【モード】共感＋質問。\n"
+                    "・前回は共感のみだったので、今回は必ず質問を1つ含める\n"
+                    "・共感/要約を述べた後、話を広げる質問を1つ添える"
+                )
             return (
                 "【モード】共感重視。\n"
                 "・共感/要約/感想を中心\n"
-                "・質問は最大1つ（できればしない）"
+                "・質問は最大1つ"
             )
         if p_want_talk >= 0.40:
             return (
@@ -224,3 +239,4 @@ class PhaseManager:
             self.logger.info("⏩ フェーズ遷移: %s → %s（%s）", self.phase.value, phase.value, reason)
             self.phase = phase
             self.turn_in_phase = 0
+            self.consecutive_empathy_only = 0
