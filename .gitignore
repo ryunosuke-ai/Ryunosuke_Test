@@ -1,6 +1,9 @@
 # 機密情報
 .env
 
+# macOS
+.DS_Store
+
 # Python
 __pycache__/
 *.pyc
