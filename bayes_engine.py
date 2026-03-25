@@ -115,9 +115,9 @@ DEFAULT_LIKELIHOODS: Dict[str, Dict[ActionType, float]] = {
         ActionType.DISCLOSURE: 0.50,
     },
     "H0": {
-        ActionType.SILENCE: 0.45,
-        ActionType.NORMAL: 0.50,
-        ActionType.DISCLOSURE: 0.05,
+        ActionType.SILENCE: 0.35,
+        ActionType.NORMAL: 0.45,
+        ActionType.DISCLOSURE: 0.20,
     },
 }
 
