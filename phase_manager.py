@@ -57,7 +57,7 @@ DEFAULT_PHASE_CONFIGS: Dict[Phase, PhaseConfig] = {
             "・直前のユーザーの返答に対して、返答内容に沿った共感やリアクションを示してから次の話題へ繋ぐこと\n"
             "・画像内の要素→連想の足場→過去/好みへ\u201c自然に\u201dつなぐ\n"
             "・足場例：場所→季節→行事→食べ物→人（いきなり深い話は聞かない）\n"
-            "・回想/自己開示が出たら深掘りへ。出なければ周囲共有に戻ってよい\n"
+            "・回想や積極的な語りが出たら深掘りへ。反応が薄ければ周囲共有に戻ってよい\n"
             "・質問は最大1つ。連続質問は禁止。相手の負担が高そうなら質問を減らす\n"
             "・【重要】会話メモ（すでに確認済み）にユーザーの好み（例：コーヒーが好き等）が書かれている場合、その前提で話を進めること。絶対に同じ質問を再度ゼロから聞かない。\n"
         ),
@@ -112,20 +112,6 @@ class PhaseManager:
 
     def transition_policy(self, obs: Observation, p_want_talk: float) -> None:
         """フェーズ遷移の核。p_want_talk は外部から受け取る。"""
-        # 沈黙カウント
-        if obs.action_type == ActionType.SILENCE:
-            self.consecutive_silence += 1
-        else:
-            self.consecutive_silence = 0
-
-        # 連続沈黙が続くなら負荷を下げる
-        if self.consecutive_silence >= 2 and self.phase not in [Phase.ENDING]:
-            if p_want_talk < 0.20:
-                self._set_phase(Phase.ENDING, reason="沈黙が続き、負担が高そう")
-                return
-            self._set_phase(Phase.SURROUNDINGS, reason="沈黙が続いたため、周囲共有へ戻す")
-            return
-
         cfg = self.phase_configs[self.phase]
 
         # フェーズ内ターン数上限
@@ -140,33 +126,48 @@ class PhaseManager:
             return
 
         if self.phase == Phase.INTRO:
-            if obs.action_type != ActionType.SILENCE:
-                self._set_phase(Phase.SURROUNDINGS, reason="導入完了")
+            self._set_phase(Phase.SURROUNDINGS, reason="導入完了")
             return
 
         if self.phase == Phase.SURROUNDINGS:
-            if self.turn_in_phase >= 1 and obs.action_type != ActionType.SILENCE:
+            if self.turn_in_phase >= 1:
                 self._set_phase(Phase.BRIDGE, reason="共同注意ができたので連想へ")
             return
 
         if self.phase == Phase.BRIDGE:
-            if obs.memory_flag or obs.action_type == ActionType.DISCLOSURE:
+            if obs.action_type == ActionType.DISENGAGE:
                 self.bridge_fail_count = 0
-                self._set_phase(Phase.DEEP_DIVE, reason="回想が出たため深掘りへ")
+                if p_want_talk < 0.30:
+                    self._set_phase(Phase.ENDING, reason="連想で拒否が出たため終了へ")
+                else:
+                    self._set_phase(Phase.SURROUNDINGS, reason="連想で負担が高そうなので周囲共有へ戻す")
                 return
-            if obs.action_type == ActionType.SILENCE or p_want_talk < 0.35:
+            if obs.memory_flag or obs.action_type == ActionType.ACTIVE:
+                self.bridge_fail_count = 0
+                self._set_phase(Phase.DEEP_DIVE, reason="回想または積極的な語りが出たため深掘りへ")
+                return
+            if obs.action_type == ActionType.MINIMAL or p_want_talk < 0.35:
                 self.bridge_fail_count += 1
+            else:
+                self.bridge_fail_count = 0
             if self.bridge_fail_count >= 2:
                 self.bridge_fail_count = 0
-                self._set_phase(Phase.SURROUNDINGS, reason="回想が出にくいので周囲共有に戻す")
+                self._set_phase(Phase.SURROUNDINGS, reason="深まりにくいので周囲共有に戻す")
                 return
             return
 
         if self.phase == Phase.DEEP_DIVE:
-            if obs.action_type == ActionType.DISCLOSURE:
+            if obs.action_type == ActionType.DISENGAGE:
+                self.deep_drop_count = 0
+                if p_want_talk < 0.30:
+                    self._set_phase(Phase.ENDING, reason="深掘りで拒否が出たため終了へ")
+                else:
+                    self._set_phase(Phase.SURROUNDINGS, reason="深掘りで拒否が出たため周囲共有へ戻す")
+                return
+            if obs.action_type in [ActionType.ACTIVE, ActionType.RESPONSIVE]:
                 self.deep_drop_count = 0
                 return
-            if obs.action_type in [ActionType.NORMAL, ActionType.SILENCE]:
+            if obs.action_type == ActionType.MINIMAL:
                 self.deep_drop_count += 1
             if self.deep_drop_count >= 2:
                 if p_want_talk < 0.30:
@@ -191,21 +192,22 @@ class PhaseManager:
         if self.phase == Phase.ENDING:
             return "【モード】終了：質問禁止。感想と感謝で閉じる。"
 
-        if obs.action_type == ActionType.SILENCE:
+        if obs.action_type == ActionType.DISENGAGE:
             return (
-                "【モード】低負荷：相手を急かさない。\n"
-                "・短い気遣い＋沈黙の余白\n"
-                "・質問はしない（しても『大丈夫？』の1回まで）"
+                "【モード】負荷を下げる。\n"
+                "・まず拒否や負担感を受け止める\n"
+                "・新しい深掘り質問はしない\n"
+                "・必要なら話題を戻すか、自然に締めへ向かう"
             )
 
-        if obs.action_type == ActionType.NORMAL and obs.minimal_reply:
+        if obs.action_type == ActionType.MINIMAL:
             return (
-                "【モード】軽い誘導（生返事）。\n"
+                "【モード】軽い誘導。\n"
                 "・短いコメント→負担の小さい質問を1つ（はい/いいえ or 二択）\n"
                 "・同じことは聞き返さない"
             )
 
-        if p_want_talk >= 0.70:
+        if obs.action_type == ActionType.ACTIVE or p_want_talk >= 0.70:
             if self.consecutive_empathy_only >= 1:
                 return (
                     "【モード】共感＋質問。\n"
@@ -217,7 +219,7 @@ class PhaseManager:
                 "・ユーザが話したい気持ちが強いため、ユーザの返答を基に共感や感想を中心にする\n"
                 "・質問は最大1つ。ただし、共感重視なので、質問はしなくても良い。"
             )
-        if p_want_talk >= 0.40:
+        if obs.action_type == ActionType.RESPONSIVE or p_want_talk >= 0.40:
             return (
                 "【モード】軽い誘導。\n"
                 "・コメント→小さな質問1つ（はい/いいえ、二択など）\n"

@@ -6,9 +6,10 @@ from typing import Optional, List
 
 
 class ActionType(str, Enum):
-    SILENCE = "SILENCE"
-    NORMAL = "NORMAL"
-    DISCLOSURE = "DISCLOSURE"
+    ACTIVE = "ACTIVE"
+    RESPONSIVE = "RESPONSIVE"
+    MINIMAL = "MINIMAL"
+    DISENGAGE = "DISENGAGE"
 
 
 class Phase(str, Enum):
@@ -32,10 +33,15 @@ class PhaseConfig:
 class Observation:
     user_text: Optional[str]
     action_type: ActionType
-    minimal_reply: bool = False
     memory_flag: bool = False
-    self_disclosure_flag: bool = False
     engagement_hint: Optional[str] = None
+    label_reason: Optional[str] = None
+
+
+@dataclass
+class ClassificationResult:
+    action_type: ActionType
+    reason: Optional[str] = None
 
 
 @dataclass

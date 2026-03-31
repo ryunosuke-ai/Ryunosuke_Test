@@ -19,14 +19,12 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="repla
 load_dotenv()
 
 # 後方互換: from bayes_v3 import ActionType 等を維持
-from models import ActionType, Phase, PhaseConfig, Observation, MemoryUpdate  # noqa: E402, F401
+from models import ActionType, Phase, PhaseConfig, Observation, MemoryUpdate, ClassificationResult  # noqa: E402, F401
 from bayes_engine import (  # noqa: E402
     update_posterior as _update_posterior,
-    is_minimal_reply,
     classify_action as _classify_action,
-    judge_memory_and_disclosure as _judge_memory_and_disclosure,
+    judge_memory_signal as _judge_memory_signal,
     DEFAULT_LIKELIHOODS,
-    DEFAULT_MINIMAL_LIKELIHOOD,
 )
 from phase_manager import PhaseManager, DEFAULT_PHASE_CONFIGS  # noqa: E402
 from conv_memory import (  # noqa: E402
@@ -81,7 +79,7 @@ class MultimodalAgent:
         self.analysis_csv = f"{self.run_dir}/analysis_{ts}.csv"
 
         with open(self.analysis_csv, "w", encoding="utf-8") as f:
-            f.write("Timestamp,Turn,Phase,Speaker,ActionType,P_WantTalk,Text\n")
+            f.write("Timestamp,Turn,Phase,Speaker,PrimaryLabel,LabelReason,P_WantTalk,Text\n")
 
         self._setup_logger(ts)
         self._load_static_image()
@@ -124,7 +122,6 @@ class MultimodalAgent:
         self.p_want_talk: float = 0.5
 
         self.likelihoods = DEFAULT_LIKELIHOODS
-        self.minimal_normal_likelihood = DEFAULT_MINIMAL_LIKELIHOOD
 
         self.asked_initial_image_question: bool = False
 
@@ -264,40 +261,45 @@ class MultimodalAgent:
     # -----------------------------
     # 分析用データのロギング
     # -----------------------------
-    def log_interaction(self, speaker: str, text: str, action_type: str = "") -> None:
+    def log_interaction(
+        self,
+        speaker: str,
+        text: str,
+        primary_label: str = "",
+        label_reason: str = "",
+    ) -> None:
         ts = datetime.now().strftime('%H:%M:%S')
         safe_text = str(text).replace('"', '""').replace('\n', ' ')
+        safe_reason = str(label_reason).replace('"', '""').replace('\n', ' ')
         try:
             with open(self.analysis_csv, "a", encoding="utf-8") as f:
-                f.write(f"{ts},{self.total_turns},{self.phase.name},{speaker},{action_type},{self.p_want_talk:.2f},\"{safe_text}\"\n")
+                f.write(
+                    f'{ts},{self.total_turns},{self.phase.name},{speaker},'
+                    f'{primary_label},"{safe_reason}",{self.p_want_talk:.2f},"{safe_text}"\n'
+                )
         except Exception as e:
             self.logger.warning("CSV書き込み失敗: %s", e)
 
     # -----------------------------
     # ベイズ更新（委譲）
     # -----------------------------
-    def update_posterior(self, action_type: ActionType, minimal_reply: bool = False) -> float:
+    def update_posterior(self, action_type: ActionType) -> float:
         prior = float(self.p_want_talk)
         self.p_want_talk = _update_posterior(
-            prior, action_type, minimal_reply,
+            prior, action_type,
             likelihoods=self.likelihoods,
-            minimal_likelihood=self.minimal_normal_likelihood,
         )
-        tag = f"{action_type.value}" + ("(MIN)" if (action_type == ActionType.NORMAL and minimal_reply) else "")
-        print(f"📊 P(話したい) 事前 {prior:.2f} → 観測 {tag} → 事後 {self.p_want_talk:.2f}")
+        print(f"📊 P(話したい) 事前 {prior:.2f} → 観測 {action_type.value} → 事後 {self.p_want_talk:.2f}")
         return self.p_want_talk
 
     # -----------------------------
     # 観測分類（委譲）
     # -----------------------------
-    def _is_minimal_reply(self, user_text: Optional[str]) -> bool:
-        return is_minimal_reply(user_text)
-
-    def classify_action(self, user_text: Optional[str]) -> ActionType:
+    def classify_action(self, user_text: Optional[str]) -> ClassificationResult:
         return _classify_action(self.openai_client, self.deployment_name, user_text, self.logger)
 
-    def judge_memory_and_disclosure(self, user_text: Optional[str]):
-        return _judge_memory_and_disclosure(self.openai_client, self.deployment_name, user_text, self.logger)
+    def judge_memory_signal(self, user_text: Optional[str]):
+        return _judge_memory_signal(self.openai_client, self.deployment_name, user_text, self.logger)
 
     # -----------------------------
     # フェーズ遷移（委譲）
@@ -335,7 +337,7 @@ class MultimodalAgent:
     def _interaction_mode_instruction(self, obs: Observation) -> str:
         return self.phase_mgr.get_interaction_mode_instruction(obs, self.p_want_talk)
 
-    def think_and_reply(self, obs: Observation, base64_image: Optional[str]) -> str:
+    def think_and_reply(self, obs: Observation, base64_image: Optional[str], waiting_mode: bool = False) -> str:
         cfg = self.phase_configs[self.phase]
 
         history = self.load_history_as_messages(max_messages=10)
@@ -351,10 +353,20 @@ class MultimodalAgent:
             #initial_question_instruction = "【重要】このターンの発言の最初 または 最後に、必ず「なぜフード付きのシャツを着た男性とパイプを持っている男性が話していると思いますか？」という趣旨の質問を組み込んでください。\n"
             self.asked_initial_image_question = True
 
+        waiting_instruction = ""
+        if waiting_mode:
+            waiting_instruction = (
+                "【現在状況】ユーザーは返答内容を考えている途中です。\n"
+                "【待機応答】急かさず、履歴に沿った短いひと言だけ述べて待つこと。\n"
+                "【禁止】深掘りの継続、連続質問、終了誘導。\n"
+                "【長さ】30〜70文字程度。\n"
+            )
+        length_instruction = "【長さ】30〜70文字程度。\n" if waiting_mode else "【長さ】60〜120文字程度。\n"
+
         system_prompt = (
             "あなたは親しみやすい会話ロボットです。\n"
             "【重要】返答は自然な日本語。できるだけカタカナ語を避ける。\n"
-            "【長さ】60〜120文字程度。\n"
+            f"{length_instruction}"
             "【形式】短いコメント→（必要なら）質問は最大1つ。\n"
             "【禁止】連続質問、同じ内容の聞き返し、説教、詰問。\n"
             "\n"
@@ -369,7 +381,7 @@ class MultimodalAgent:
             f"【現在フェーズ】{cfg.name.value}\n"
             f"{cfg.instruction}\n"
             f"{initial_question_instruction}"
-            f"{self._interaction_mode_instruction(obs)}\n"
+            f"{waiting_instruction if waiting_mode else self._interaction_mode_instruction(obs)}\n"
         )
 
         messages = [{"role": "system", "content": system_prompt}]
@@ -379,7 +391,9 @@ class MultimodalAgent:
         if obs.user_text:
             user_content.append({"type": "text", "text": obs.user_text})
         else:
-            user_content.append({"type": "text", "text": "(ユーザーは沈黙しています。急かさず、短い気遣いをしてください。)"})
+            user_content.append(
+                {"type": "text", "text": "(ユーザーは返答を考えています。急かさず、短い待機のひと言だけ返してください。)"}
+            )
 
         if base64_image:
             user_content.append({
@@ -453,39 +467,45 @@ class MultimodalAgent:
         self.log_interaction("AI", initial_greeting, "")
 
         while True:
+            user_text = self.listen()
+            if not user_text:
+                img_b64 = None
+                if self.phase != Phase.ENDING and self.phase_configs[self.phase].require_image:
+                    img_b64 = self.static_image_b64
+                waiting_obs = Observation(user_text=None, action_type=ActionType.MINIMAL)
+                wait_reply = self.think_and_reply(waiting_obs, img_b64, waiting_mode=True)
+                self.speak(wait_reply)
+                if self.phase == Phase.ENDING:
+                    break
+                continue
+
             self.total_turns += 1
             self.phase_mgr.turn_in_phase += 1
 
-            user_text = self.listen()
-
-            if user_text:
-                self.update_conv_memory(user_text)
+            self.update_conv_memory(user_text)
 
             if self.conv_memory.stop_intent and self.phase != Phase.ENDING:
                 self.force_end = True
                 self._set_phase(Phase.ENDING, reason="ユーザー終了希望")
 
-            action_type = self.classify_action(user_text)
-            minimal_reply = self._is_minimal_reply(user_text)
+            classification = self.classify_action(user_text)
+            action_type = classification.action_type
 
-            self.update_posterior(action_type, minimal_reply=minimal_reply)
+            self.update_posterior(action_type)
 
-            logged_text = user_text if user_text else "(沈黙)"
-            self.log_interaction("User", logged_text, action_type.value)
+            self.log_interaction("User", user_text, action_type.value, classification.reason or "")
 
             memory_flag = False
-            disclosure_flag = False
             note = None
-            if self.phase in [Phase.BRIDGE, Phase.DEEP_DIVE] and user_text:
-                memory_flag, disclosure_flag, note = self.judge_memory_and_disclosure(user_text)
+            if self.phase in [Phase.BRIDGE, Phase.DEEP_DIVE]:
+                memory_flag, note = self.judge_memory_signal(user_text)
 
             obs = Observation(
                 user_text=user_text,
                 action_type=action_type,
-                minimal_reply=minimal_reply,
                 memory_flag=memory_flag,
-                self_disclosure_flag=disclosure_flag,
-                engagement_hint=note
+                engagement_hint=note,
+                label_reason=classification.reason,
             )
 
             if self.total_turns >= self.max_total_turns and self.phase != Phase.ENDING:

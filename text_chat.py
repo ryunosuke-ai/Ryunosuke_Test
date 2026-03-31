@@ -17,14 +17,12 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="repla
 
 load_dotenv()
 
-from models import ActionType, Phase, PhaseConfig, Observation, MemoryUpdate  # noqa: E402
+from models import ActionType, Phase, PhaseConfig, Observation, MemoryUpdate, ClassificationResult  # noqa: E402
 from bayes_engine import (  # noqa: E402
     update_posterior as _update_posterior,
-    is_minimal_reply,
     classify_action as _classify_action,
-    judge_memory_and_disclosure as _judge_memory_and_disclosure,
+    judge_memory_signal as _judge_memory_signal,
     DEFAULT_LIKELIHOODS,
-    DEFAULT_MINIMAL_LIKELIHOOD,
 )
 from phase_manager import PhaseManager  # noqa: E402
 from conv_memory import (  # noqa: E402
@@ -70,7 +68,7 @@ class TextChatAgent:
         self.analysis_csv = f"{self.run_dir}/analysis_{ts}.csv"
 
         with open(self.analysis_csv, "w", encoding="utf-8") as f:
-            f.write("Timestamp,Turn,Phase,Speaker,ActionType,P_WantTalk,Text\n")
+            f.write("Timestamp,Turn,Phase,Speaker,PrimaryLabel,LabelReason,P_WantTalk,Text\n")
 
         self._setup_logger(ts)
         self._load_static_image()
@@ -93,7 +91,6 @@ class TextChatAgent:
         self.p_want_talk: float = 0.5
 
         self.likelihoods = DEFAULT_LIKELIHOODS
-        self.minimal_normal_likelihood = DEFAULT_MINIMAL_LIKELIHOOD
 
         self.asked_initial_image_question: bool = False
 
@@ -150,7 +147,7 @@ class TextChatAgent:
     # テキスト I/O
     # -----------------------------
     def get_input(self) -> Optional[str]:
-        """テキスト入力を取得。空Enterは沈黙（None）として扱う。"""
+        """テキスト入力を取得。空Enterは考え中（None）として扱う。"""
         try:
             text = input("\nあなた: ").strip()
         except EOFError:
@@ -158,7 +155,7 @@ class TextChatAgent:
         if text:
             self.append_to_history("User", text)
             return text
-        print("  （沈黙として処理します）")
+        print("  （考え中として待機します）")
         return None
 
     def output(self, text: str) -> None:
@@ -171,16 +168,19 @@ class TextChatAgent:
     # -----------------------------
     # 調査用ステータス表示
     # -----------------------------
-    def display_status(self, action_type: ActionType, minimal_reply: bool,
-                       prior: float, posterior: float) -> None:
+    def display_status(
+        self,
+        action_type: ActionType,
+        prior: float,
+        posterior: float,
+        label_reason: Optional[str] = None,
+    ) -> None:
         """フェーズ・ターン・観測・話したい度バーを表示する。"""
         phase_name = self.phase_mgr.phase.value
         turn_total = self.total_turns
         turn_in_phase = self.phase_mgr.turn_in_phase
 
         tag = action_type.value
-        if action_type == ActionType.NORMAL and minimal_reply:
-            tag += "(MIN)"
 
         # 話したい度バー（20文字幅）
         bar_len = 20
@@ -191,41 +191,52 @@ class TextChatAgent:
         print(f"  フェーズ  : {phase_name}")
         print(f"  ターン    : {turn_total}/{self.max_total_turns} (フェーズ内: {turn_in_phase})")
         print(f"  観測      : {tag}")
+        if label_reason:
+            print(f"  判定理由  : {label_reason}")
         print(f"  話したい度: {prior:.2f} → {posterior:.2f}  [{bar}]")
         print(f"{'─' * 42}")
 
     # -----------------------------
     # 分析用データのロギング
     # -----------------------------
-    def log_interaction(self, speaker: str, text: str, action_type: str = "") -> None:
+    def log_interaction(
+        self,
+        speaker: str,
+        text: str,
+        primary_label: str = "",
+        label_reason: str = "",
+    ) -> None:
         ts = datetime.now().strftime('%H:%M:%S')
         safe_text = str(text).replace('"', '""').replace('\n', ' ')
+        safe_reason = str(label_reason).replace('"', '""').replace('\n', ' ')
         try:
             with open(self.analysis_csv, "a", encoding="utf-8") as f:
-                f.write(f"{ts},{self.total_turns},{self.phase_mgr.phase.name},{speaker},{action_type},{self.p_want_talk:.2f},\"{safe_text}\"\n")
+                f.write(
+                    f'{ts},{self.total_turns},{self.phase_mgr.phase.name},{speaker},'
+                    f'{primary_label},"{safe_reason}",{self.p_want_talk:.2f},"{safe_text}"\n'
+                )
         except Exception as e:
             self.logger.warning("CSV書き込み失敗: %s", e)
 
     # -----------------------------
     # ベイズ更新（委譲）
     # -----------------------------
-    def update_posterior(self, action_type: ActionType, minimal_reply: bool = False) -> float:
+    def update_posterior(self, action_type: ActionType) -> float:
         prior = float(self.p_want_talk)
         self.p_want_talk = _update_posterior(
-            prior, action_type, minimal_reply,
+            prior, action_type,
             likelihoods=self.likelihoods,
-            minimal_likelihood=self.minimal_normal_likelihood,
         )
         return self.p_want_talk
 
     # -----------------------------
     # 観測分類（委譲）
     # -----------------------------
-    def classify_action(self, user_text: Optional[str]) -> ActionType:
+    def classify_action(self, user_text: Optional[str]) -> ClassificationResult:
         return _classify_action(self.openai_client, self.deployment_name, user_text, self.logger)
 
-    def judge_memory_and_disclosure(self, user_text: Optional[str]):
-        return _judge_memory_and_disclosure(self.openai_client, self.deployment_name, user_text, self.logger)
+    def judge_memory_signal(self, user_text: Optional[str]):
+        return _judge_memory_signal(self.openai_client, self.deployment_name, user_text, self.logger)
 
     # -----------------------------
     # フェーズ遷移（委譲）
@@ -251,7 +262,7 @@ class TextChatAgent:
     # -----------------------------
     # 返信生成（LLM）
     # -----------------------------
-    def think_and_reply(self, obs: Observation, base64_image: Optional[str]) -> str:
+    def think_and_reply(self, obs: Observation, base64_image: Optional[str], waiting_mode: bool = False) -> str:
         cfg = self.phase_mgr.phase_configs[self.phase_mgr.phase]
 
         history = self.load_history_as_messages(max_messages=10)
@@ -267,12 +278,26 @@ class TextChatAgent:
             #initial_question_instruction = "【重要】このターンの発言の最初 または 最後に、必ず「なぜフード付きのシャツを着た男性とパイプを持っている男性が話していると思いますか？」という趣旨の質問を組み込んでください。\n"
             self.asked_initial_image_question = True
 
-        interaction_mode = self.phase_mgr.get_interaction_mode_instruction(obs, self.p_want_talk)
+        waiting_instruction = ""
+        if waiting_mode:
+            waiting_instruction = (
+                "【現在状況】ユーザーは返答内容を考えている途中です。\n"
+                "【待機応答】急かさず、履歴に沿った短いひと言だけ述べて待つこと。\n"
+                "【禁止】深掘りの継続、連続質問、終了誘導。\n"
+                "【長さ】30〜70文字程度。\n"
+            )
+        length_instruction = "【長さ】30〜70文字程度。\n" if waiting_mode else "【長さ】60〜120文字程度。\n"
+
+        interaction_mode = (
+            waiting_instruction
+            if waiting_mode
+            else self.phase_mgr.get_interaction_mode_instruction(obs, self.p_want_talk)
+        )
 
         system_prompt = (
             "あなたは親しみやすい会話ロボットです。\n"
             "【重要】返答は自然な日本語。できるだけカタカナ語を避ける。\n"
-            "【長さ】60〜120文字程度。\n"
+            f"{length_instruction}"
             "【形式】短いコメント→（必要なら）質問は最大1つ。\n"
             "【禁止】連続質問、同じ内容の聞き返し、説教、詰問。\n"
             "\n"
@@ -297,7 +322,9 @@ class TextChatAgent:
         if obs.user_text:
             user_content.append({"type": "text", "text": obs.user_text})
         else:
-            user_content.append({"type": "text", "text": "(ユーザーは沈黙しています。急かさず、短い気遣いをしてください。)"})
+            user_content.append(
+                {"type": "text", "text": "(ユーザーは返答を考えています。急かさず、短い待機のひと言だけ返してください。)"}
+            )
 
         if base64_image:
             user_content.append({
@@ -316,7 +343,7 @@ class TextChatAgent:
             )
             return (res.choices[0].message.content or "").strip()
         except Exception as e:
-            self.logger.warning("生成LLM失敗: %s", e)
+            self.logger.warning("生成失敗: %s", e)
             return "ごめんなさい、少し調子が悪いみたいです。落ち着いたらまた話しかけてくださいね。"
 
     def load_history_as_messages(self, max_messages: int = 10) -> List[dict]:
@@ -347,7 +374,7 @@ class TextChatAgent:
     # -----------------------------
     def run(self) -> None:
         self._banner("テキストベース会話ツール（話したい度 調査用）")
-        print("  空Enter = 沈黙 / Ctrl+C = 終了")
+        print("  空Enter = 考え中として待機 / Ctrl+C = 終了")
         print(f"  最大ターン数: {self.max_total_turns}")
         print(f"  ログ出力先: {self.run_dir}/")
         if not self.static_image_b64:
@@ -360,44 +387,52 @@ class TextChatAgent:
 
         try:
             while True:
+                user_text = self.get_input()
+                if not user_text:
+                    img_b64 = None
+                    if self.phase_mgr.phase != Phase.ENDING and self.phase_mgr.phase_configs[self.phase_mgr.phase].require_image:
+                        img_b64 = self.static_image_b64
+                    waiting_obs = Observation(user_text=None, action_type=ActionType.MINIMAL)
+                    wait_reply = self.think_and_reply(waiting_obs, img_b64, waiting_mode=True)
+                    self.output(wait_reply)
+                    if self.phase_mgr.phase == Phase.ENDING:
+                        print("\n会話を終了します。ログは以下に保存されています:")
+                        print(f"  {self.run_dir}/")
+                        break
+                    continue
+
                 self.total_turns += 1
                 self.phase_mgr.turn_in_phase += 1
 
-                user_text = self.get_input()
-
-                if user_text:
-                    self.update_conv_memory(user_text)
+                self.update_conv_memory(user_text)
 
                 if self.conv_memory.stop_intent and self.phase_mgr.phase != Phase.ENDING:
                     self.force_end = True
                     self.phase_mgr._set_phase(Phase.ENDING, reason="ユーザー終了希望")
 
-                action_type = self.classify_action(user_text)
-                minimal_reply = is_minimal_reply(user_text)
+                classification = self.classify_action(user_text)
+                action_type = classification.action_type
 
                 prior = float(self.p_want_talk)
-                self.update_posterior(action_type, minimal_reply=minimal_reply)
+                self.update_posterior(action_type)
                 posterior = float(self.p_want_talk)
 
                 # 調査用ステータス表示
-                self.display_status(action_type, minimal_reply, prior, posterior)
+                self.display_status(action_type, prior, posterior, classification.reason)
 
-                logged_text = user_text if user_text else "(沈黙)"
-                self.log_interaction("User", logged_text, action_type.value)
+                self.log_interaction("User", user_text, action_type.value, classification.reason or "")
 
                 memory_flag = False
-                disclosure_flag = False
                 note = None
-                if self.phase_mgr.phase in [Phase.BRIDGE, Phase.DEEP_DIVE] and user_text:
-                    memory_flag, disclosure_flag, note = self.judge_memory_and_disclosure(user_text)
+                if self.phase_mgr.phase in [Phase.BRIDGE, Phase.DEEP_DIVE]:
+                    memory_flag, note = self.judge_memory_signal(user_text)
 
                 obs = Observation(
                     user_text=user_text,
                     action_type=action_type,
-                    minimal_reply=minimal_reply,
                     memory_flag=memory_flag,
-                    self_disclosure_flag=disclosure_flag,
                     engagement_hint=note,
+                    label_reason=classification.reason,
                 )
 
                 if self.total_turns >= self.max_total_turns and self.phase_mgr.phase != Phase.ENDING:

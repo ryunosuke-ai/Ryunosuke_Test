@@ -1,154 +1,101 @@
 """ベイズ更新 + 観測分類（LLM利用）"""
 
-import re
 import json
 import logging
-from typing import Optional, Tuple, Dict
+import re
+from typing import Dict, Optional, Tuple
 
-from models import ActionType
+from models import ActionType, ClassificationResult
 
 
 # --- LLMプロンプト定数 ---
 
-# classify_action() 用: 社会的浸透理論に基づく発話分類プロンプト
 CLASSIFY_ACTION_PROMPT = (
-    "あなたは対話分析の専門家です。社会的浸透理論に基づき、"
-    "ユーザー発言の「自己開示の深さ」を判定してください。\n"
+    "あなたは対話分析の専門家です。ユーザー発話を、会話継続への姿勢に基づいて "
+    "ACTIVE / RESPONSIVE / MINIMAL / DISENGAGE の4値のいずれか1つに分類してください。\n"
     "\n"
-    "## 判定基準\n"
+    "## 分類原則\n"
+    "- 長さではなく、会話を続ける方向に働いているかを優先する\n"
+    "- 感情の強さではなく、会話参加の姿勢をみる\n"
+    "- 必ず4値のどれか1つに落とす\n"
     "\n"
-    "自己開示とは「自分自身に関する個人的な情報を他者に意図的に伝える行為」です。\n"
-    "以下の基準で DISCLOSURE か NORMAL かを判定してください。\n"
+    "## ラベル定義\n"
     "\n"
-    "### DISCLOSURE（自己開示あり）と判定する条件\n"
-    "次のいずれか1つ以上に該当する場合：\n"
+    "### ACTIVE\n"
+    "- 自発的に話を広げる、追加情報を出す、話題を拡張する、相手に聞き返す\n"
+    "- 例: 『高校の頃によくその公園に行ってたんです。夏祭りが好きでした』\n"
     "\n"
-    "【感情・内面の表出】\n"
-    "  - 感情や気持ちを表現している（嬉しい、寂しい、不安、楽しかった、つらかった 等）\n"
-    "  - 価値判断や個人的な評価を含む（好き、嫌い、苦手、大事にしている 等）\n"
+    "### RESPONSIVE\n"
+    "- 問いに対して意味のある返答をしているが、自発的な拡張は強くない\n"
+    "- 例: 『はい、行ったことがあります』『学生の頃です』\n"
     "\n"
-    "【個人的な体験・記憶】\n"
-    "  - 過去のエピソードを語っている（昔〜した、子どもの頃〜、あの時〜 等）\n"
-    "  - 具体的な場面や人物が登場する体験談（いつ・どこで・誰と・何をした）\n"
+    "### MINIMAL\n"
+    "- 最小限の反応はあるが、内容の広がりが乏しく、積極性が弱い\n"
+    "- 例: 『うん』『そうですね』『まあ』『たぶん』\n"
     "\n"
-    "【個人の属性・背景の能動的な共有】\n"
-    "  - 自分の趣味・習慣・こだわりを説明している（毎朝〜する、いつも〜している 等）\n"
-    "  - 家族構成、出身地、職歴など個人的な背景情報を自ら語っている\n"
+    "### DISENGAGE\n"
+    "- 会話継続に消極的で、拒否・終了・回避の方向が明確\n"
+    "- 例: 『その話はしたくないです』『今日はこのへんで』\n"
     "\n"
-    "【願望・意図・将来の計画】\n"
-    "  - 個人的な希望や夢を語っている（〜したい、〜に行ってみたい 等）\n"
-    "  - 自分なりの考えや信念を述べている\n"
+    "## 境界ルール\n"
+    "- 短くても質問への意味ある返答なら RESPONSIVE\n"
+    "- 詳しくても拒否や終了意図が中心なら DISENGAGE\n"
+    "- 単なる相づちや曖昧応答は MINIMAL\n"
+    "- 必要最小限を超えて話を前に進めるなら ACTIVE\n"
     "\n"
-    "### NORMAL（自己開示なし）と判定する条件\n"
-    "次のいずれかに該当する場合：\n"
-    "\n"
-    "【相づち・最小応答】\n"
-    "  - 「はい」「うん」「そうですね」「なるほど」「ありがとう」など\n"
-    "  - 会話を継続する意思表示のみで、新しい個人情報を含まない\n"
-    "\n"
-    "【現在の状況の事実報告のみ】\n"
-    "  - 「今日は家にいます」「特に予定ないです」「天気がいいですね」など\n"
-    "  - 自分の状態を述べているが、感情・評価・背景情報を伴わない単なる状況描写\n"
-    "\n"
-    "【一般的な知識・客観的事実】\n"
-    "  - 「桜は春に咲きますね」「東京は暑いですね」など\n"
-    "  - 個人に紐づかない一般論や客観的事実のみ\n"
-    "\n"
-    "【質問・確認】\n"
-    "  - 「それはどういう意味ですか？」「何時ですか？」など\n"
-    "  - 相手への質問で、自分の情報を含まない\n"
-    "\n"
-    "## 判定のポイント\n"
-    "- 迷ったら「この発言から話者の人となり（性格・経験・価値観）が新しくわかるか？」を基準にする\n"
-    "- 同じ話題でも深さが異なる場合がある：\n"
-    "  ・「コーヒー飲みます」→ NORMAL（状況報告）\n"
-    "  ・「コーヒーが好きなんです、毎朝必ず飲みます」→ DISCLOSURE（好み＋習慣）\n"
-    "  ・「昔、祖父とよく喫茶店に行ったんです」→ DISCLOSURE（体験＋人物）\n"
-    "\n"
-    "出力は DISCLOSURE か NORMAL のどちらか1語のみ。"
+    "出力は JSON のみ: "
+    "{\"primary_label\": \"ACTIVE|RESPONSIVE|MINIMAL|DISENGAGE\", "
+    "\"reason\": \"判定理由を1〜3文で簡潔に\"}"
 )
 
-# judge_memory_and_disclosure() 用: 回想・自己開示の2軸判定プロンプト
-JUDGE_MEMORY_PROMPT = (
-    "あなたは対話分析の専門家です。ユーザー発言について2つの軸で判定してください。\n"
+JUDGE_MEMORY_SIGNAL_PROMPT = (
+    "あなたは対話分析の専門家です。ユーザー発話に、回想や具体的なエピソード記憶が含まれるかを判定してください。\n"
     "\n"
-    "## 判定軸\n"
-    "\n"
-    "### 1. memory_flag（回想・エピソード記憶）\n"
-    "以下に該当すれば true:\n"
-    "- 過去の出来事を時間的に位置づけて語っている（「昔」「子どもの頃」「あの時」「〜年前」等）\n"
+    "### memory_flag を true にする条件\n"
+    "- 過去の出来事を時間的に位置づけて語っている\n"
     "- 特定の場面・場所・人物が登場する体験を述べている\n"
-    "- 「〜したことがある」「〜だった」など過去形で個人的体験を語っている\n"
+    "- 個人的な出来事を過去形で語っている\n"
     "\n"
-    "以下は false:\n"
-    "- 一般的な知識や習慣の説明（「日本では〜する」）\n"
-    "- 現在の状態のみ（「今日は暇です」）\n"
-    "- 習慣的な行動で特定の過去の場面を指さない（「毎日散歩します」）\n"
+    "### false にする条件\n"
+    "- 現在の好みや評価だけを述べている\n"
+    "- 相づちや短い返答のみ\n"
+    "- 一般論や客観的事実のみ\n"
+    "- 習慣の説明だけで、特定の出来事を指していない\n"
     "\n"
-    "### 2. self_disclosure_flag（自己開示）\n"
-    "以下に該当すれば true:\n"
-    "- 感情・気持ちを表現している（嬉しかった、寂しい、好き、嫌い 等）\n"
-    "- 個人的な好み・価値観・信念を述べている（大事にしている、こだわり 等）\n"
-    "- 自分の性格や特徴に言及している（人見知りで〜、心配性なので〜 等）\n"
-    "- 個人的な願望や夢を語っている（〜したい、〜に行ってみたい 等）\n"
-    "\n"
-    "以下は false:\n"
-    "- 事実のみの応答で感情・評価を含まない\n"
-    "- 相づちや短い肯定のみ\n"
-    "- 一般論や客観的事実の述べ立てのみ\n"
-    "\n"
-    "## 判定のポイント\n"
-    "- memory_flag と self_disclosure_flag は独立した軸である。両方 true もありえる\n"
-    "  例: 「子どもの頃、祖母の作る煮物が大好きだった」→ memory=true（過去の体験）, disclosure=true（好みの表明）\n"
-    "- memory_flag のみ true の例: 「去年、東京に行きました」→ 過去の事実だが感情や好みを含まない\n"
-    "- self_disclosure_flag のみ true の例: 「甘いものが好きです」→ 現在の好みで過去の体験ではない\n"
-    "\n"
-    "出力は JSON のみ: {\"memory_flag\": true/false, \"self_disclosure_flag\": true/false, \"note\": \"短い所見（任意）\"}"
+    "出力は JSON のみ: "
+    "{\"memory_flag\": true/false, \"note\": \"短い所見（任意）\"}"
 )
 
 
 # 尤度テーブル（デフォルト値）
 DEFAULT_LIKELIHOODS: Dict[str, Dict[ActionType, float]] = {
     "H1": {
-        ActionType.SILENCE: 0.20,
-        ActionType.NORMAL: 0.30,
-        ActionType.DISCLOSURE: 0.50,
+        ActionType.ACTIVE: 0.45,
+        ActionType.RESPONSIVE: 0.30,
+        ActionType.MINIMAL: 0.17,
+        ActionType.DISENGAGE: 0.08,
     },
     "H0": {
-        ActionType.SILENCE: 0.35,
-        ActionType.NORMAL: 0.45,
-        ActionType.DISCLOSURE: 0.20,
+        ActionType.ACTIVE: 0.10,
+        ActionType.RESPONSIVE: 0.25,
+        ActionType.MINIMAL: 0.35,
+        ActionType.DISENGAGE: 0.30,
     },
-}
-
-# 生返事に対する尤度（NORMAL を上書き）
-DEFAULT_MINIMAL_LIKELIHOOD: Dict[str, float] = {
-    "H1": 0.15,
-    "H0": 0.70,
 }
 
 
 def update_posterior(
     p_want_talk: float,
     action_type: ActionType,
-    minimal_reply: bool = False,
-    likelihoods: Optional[Dict] = None,
-    minimal_likelihood: Optional[Dict] = None,
+    likelihoods: Optional[Dict[str, Dict[ActionType, float]]] = None,
 ) -> float:
     """ベイズ更新を行い、事後確率を返す純関数。"""
     if likelihoods is None:
         likelihoods = DEFAULT_LIKELIHOODS
-    if minimal_likelihood is None:
-        minimal_likelihood = DEFAULT_MINIMAL_LIKELIHOOD
 
     prior = float(p_want_talk)
-
     l_h1 = float(likelihoods["H1"][action_type])
     l_h0 = float(likelihoods["H0"][action_type])
-
-    if action_type == ActionType.NORMAL and minimal_reply:
-        l_h1 = float(minimal_likelihood["H1"])
-        l_h0 = float(minimal_likelihood["H0"])
 
     evidence = (l_h1 * prior) + (l_h0 * (1.0 - prior))
     if evidence <= 1e-12:
@@ -157,21 +104,6 @@ def update_posterior(
         posterior = (l_h1 * prior) / evidence
 
     return max(0.001, min(0.999, posterior))
-
-
-def is_minimal_reply(user_text: Optional[str]) -> bool:
-    """生返事（会話が広がりにくい最小応答）かどうか。"""
-    if not user_text:
-        return False
-    t = user_text.strip()
-    t2 = re.sub(r"[\s。．、,！!？?…]+", "", t)
-    if len(t2) <= 10 and re.fullmatch(
-        r"(はい|うん|そう|そうです|そうですね|なるほど|ありがとう|ありがとうございます|ええ|うーん)", t2
-    ):
-        return True
-    if len(t2) <= 4 and any(w == t2 for w in ["はい", "うん", "そう", "ええ"]):
-        return True
-    return False
 
 
 def _call_llm(client, deployment: str, messages: list, max_tokens: int, temperature: float, logger: logging.Logger):
@@ -184,55 +116,105 @@ def _call_llm(client, deployment: str, messages: list, max_tokens: int, temperat
     )
 
 
-def classify_action(client, deployment: str, user_text: Optional[str], logger: logging.Logger) -> ActionType:
-    """ユーザー発言をActionTypeに分類する。"""
-    if user_text is None:
-        return ActionType.SILENCE
+def _extract_json_object(text: str) -> dict:
+    """LLM出力から最初のJSONオブジェクトを抽出する。"""
+    if not text:
+        return {}
 
-    short = len(user_text) <= 8
-    if short and any(w in user_text for w in ["はい", "うん", "そう", "ありがとう", "ええ", "なるほど"]):
-        return ActionType.NORMAL
+    stripped = text.strip()
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        pass
 
-    prompt = CLASSIFY_ACTION_PROMPT
+    match = re.search(r"\{.*\}", stripped, re.DOTALL)
+    if not match:
+        return {}
+
+    try:
+        return json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return {}
+
+
+def _extract_label_from_text(text: str) -> Optional[ActionType]:
+    """JSON化に失敗した場合の保守的なラベル抽出。"""
+    upper = (text or "").upper()
+    for label in ActionType:
+        if label.value in upper:
+            return label
+    return None
+
+
+def classify_action(client, deployment: str, user_text: Optional[str], logger: logging.Logger) -> ClassificationResult:
+    """ユーザー発言を4主ラベルに分類し、理由も返す。"""
+    if not user_text:
+        return ClassificationResult(
+            action_type=ActionType.RESPONSIVE,
+            reason="入力が空のため、保守的に RESPONSIVE とみなしました。",
+        )
+
     messages = [
-        {"role": "system", "content": prompt},
+        {"role": "system", "content": CLASSIFY_ACTION_PROMPT},
         {"role": "user", "content": user_text},
     ]
     try:
-        res = _call_llm(client, deployment, messages, max_tokens=6, temperature=0, logger=logger)
-        out = (res.choices[0].message.content or "").strip().upper()
-        if "DISCLOSURE" in out:
-            return ActionType.DISCLOSURE
-        return ActionType.NORMAL
+        res = _call_llm(client, deployment, messages, max_tokens=120, temperature=0, logger=logger)
+        text = (res.choices[0].message.content or "").strip()
+        payload = _extract_json_object(text)
+
+        raw_label = str(payload.get("primary_label", "")).strip().upper()
+        reason = str(payload.get("reason", "")).strip() or None
+
+        if raw_label in ActionType._value2member_map_:
+            return ClassificationResult(action_type=ActionType(raw_label), reason=reason)
+
+        fallback_label = _extract_label_from_text(text)
+        if fallback_label:
+            return ClassificationResult(action_type=fallback_label, reason=reason)
+
+        logger.warning("分類LLMの出力を解釈できませんでした: %s", text)
     except Exception as e:
         logger.warning("分類LLM失敗: %s", e)
-        return ActionType.NORMAL
+
+    return ClassificationResult(
+        action_type=ActionType.RESPONSIVE,
+        reason="分類に失敗したため、保守的に RESPONSIVE とみなしました。",
+    )
 
 
-def judge_memory_and_disclosure(
-    client, deployment: str, user_text: Optional[str], logger: logging.Logger
-) -> Tuple[bool, bool, Optional[str]]:
-    """BRIDGE/DEEP_DIVEで使う観測: memory_flag, self_disclosure_flag, note。"""
+def judge_memory_signal(client, deployment: str, user_text: Optional[str], logger: logging.Logger) -> Tuple[bool, Optional[str]]:
+    """BRIDGE/DEEP_DIVEで使う観測: memory_flag, note。"""
     if not user_text:
-        return False, False, None
+        return False, None
 
-    prompt = JUDGE_MEMORY_PROMPT
     messages = [
-        {"role": "system", "content": prompt},
+        {"role": "system", "content": JUDGE_MEMORY_SIGNAL_PROMPT},
         {"role": "user", "content": user_text},
     ]
     try:
         res = _call_llm(client, deployment, messages, max_tokens=80, temperature=0, logger=logger)
         text = (res.choices[0].message.content or "").strip()
-        m1 = re.search(r'"memory_flag"\s*:\s*(true|false)', text, re.IGNORECASE)
-        m2 = re.search(r'"self_disclosure_flag"\s*:\s*(true|false)', text, re.IGNORECASE)
-        note = None
-        m3 = re.search(r'"note"\s*:\s*"([^"]*)"', text)
-        if m3:
-            note = m3.group(1)
-        mem = (m1.group(1).lower() == "true") if m1 else False
-        dis = (m2.group(1).lower() == "true") if m2 else False
-        return mem, dis, note
+        payload = _extract_json_object(text)
+
+        if payload:
+            memory_flag = bool(payload.get("memory_flag", False))
+            note = str(payload.get("note", "")).strip() or None
+            return memory_flag, note
+
+        match = re.search(r'"memory_flag"\s*:\s*(true|false)', text, re.IGNORECASE)
+        note_match = re.search(r'"note"\s*:\s*"([^"]*)"', text)
+        memory_flag = (match.group(1).lower() == "true") if match else False
+        note = note_match.group(1) if note_match else None
+        return memory_flag, note
     except Exception as e:
         logger.warning("回想判定LLM失敗: %s", e)
-        return False, False, None
+        return False, None
+
+
+def judge_memory_and_disclosure(
+    client, deployment: str, user_text: Optional[str], logger: logging.Logger
+) -> Tuple[bool, bool, Optional[str]]:
+    """後方互換のために残す。自己開示軸は使用しない。"""
+    memory_flag, note = judge_memory_signal(client, deployment, user_text, logger)
+    return memory_flag, False, note
