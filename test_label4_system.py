@@ -3,7 +3,7 @@
 import logging
 from types import SimpleNamespace
 
-from bayes_engine import classify_action, judge_memory_signal, update_posterior
+from bayes_engine import CLASSIFY_ACTION_PROMPT, classify_action, judge_memory_signal, update_posterior
 from models import ActionType, Observation, Phase
 from phase_manager import PhaseManager
 
@@ -68,6 +68,18 @@ def test_update_posterior_follows_label_order():
     posterior_active = update_posterior(prior, ActionType.ACTIVE)
 
     assert posterior_disengage < posterior_minimal < posterior_responsive < posterior_active
+
+
+def test_classify_prompt_contains_boundary_rules_and_output_constraints():
+    assert "MINIMAL と RESPONSIVE の違い" in CLASSIFY_ACTION_PROMPT
+    assert "RESPONSIVE と ACTIVE の違い" in CLASSIFY_ACTION_PROMPT
+    assert "MINIMAL と DISENGAGE の違い" in CLASSIFY_ACTION_PROMPT
+    assert "\"primary_label\"" in CLASSIFY_ACTION_PROMPT
+    assert "\"reason\"" in CLASSIFY_ACTION_PROMPT
+    assert "ACTIVE" in CLASSIFY_ACTION_PROMPT
+    assert "RESPONSIVE" in CLASSIFY_ACTION_PROMPT
+    assert "MINIMAL" in CLASSIFY_ACTION_PROMPT
+    assert "DISENGAGE" in CLASSIFY_ACTION_PROMPT
 
 
 def test_bridge_moves_to_deep_dive_on_active():
