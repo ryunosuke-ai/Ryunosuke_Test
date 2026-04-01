@@ -27,10 +27,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 # ターミナル1: UIを先に起動
-streamlit run ui_display.py
+python3 -m streamlit run ui_display.py
 
 # ターミナル2: エージェントを起動（UIの準備完了を待機してから開始）
-python bayes_v3.py
+python3 bayes_v3.py
 ```
 
 `bayes_v3.py` は `ui_ready.flag` ファイルが作成されるまで待機する。このフラグは `ui_display.py` が起動時に作成する。
@@ -38,20 +38,20 @@ python bayes_v3.py
 テキストベース（音声なし）で動作確認する場合：
 
 ```bash
-python text_chat.py
+python3 text_chat.py
 ```
 
 ## テスト
 
 ```bash
 # 全テスト実行
-python -m pytest test_bayes_v3.py test_ui_display.py -v
+python3 -m pytest test_bayes_v3.py test_ui_display.py -v
 
 # 単一テストクラス
-python -m pytest test_bayes_v3.py::TestUpdatePosterior -v
+python3 -m pytest test_bayes_v3.py::TestUpdatePosterior -v
 
 # 単一テストメソッド
-python -m pytest test_bayes_v3.py::TestUpdatePosterior::test_disclosure_raises_probability -v
+python3 -m pytest test_bayes_v3.py::TestUpdatePosterior::test_disclosure_raises_probability -v
 ```
 
 テストは Azure Speech SDK / cv2 / OpenAI API をすべてモック化しており、APIキーやネットワーク接続なしで実行可能。テンポラリディレクトリを使用するためクリーンアップ不要。

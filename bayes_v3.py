@@ -453,7 +453,7 @@ class MultimodalAgent:
                 os.remove(ui_flag)
             except OSError:
                 pass
-        print("⏳ UI起動待機中... (streamlit run ui_display.py を実行してください)")
+        print("⏳ UI起動待機中... (python3 -m streamlit run ui_display.py を実行してください)")
         while not os.path.exists(ui_flag):
             time.sleep(0.5)
         print("✅ UIが起動しました。会話を開始します。")

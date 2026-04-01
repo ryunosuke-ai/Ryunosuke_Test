@@ -17,13 +17,13 @@
 
 ```bash
 # ターミナル1: UI
-streamlit run ui_display.py
+python3 -m streamlit run ui_display.py
 
 # ターミナル2: エージェント本体
-python bayes_v3.py
+python3 bayes_v3.py
 ```
 
-`ui_display.py` は起動時に `ui_ready.flag` を作成し、`bayes_v3.py` はそのフラグを確認してから開始します。音声 I/O を使わずに会話ロジックだけ確認したい場合は、`python text_chat.py` を使います。
+`ui_display.py` は起動時に `ui_ready.flag` を作成し、`bayes_v3.py` はそのフラグを確認してから開始します。音声 I/O を使わずに会話ロジックだけ確認したい場合は、`python3 text_chat.py` を使います。
 
 ## 使い方
 通常運用では、マイク入力と音声出力を使って会話します。会話中はユーザー発話の種類と `p_want_talk` に応じて、質問の強さや話題の深さが変わります。テキスト版では、コンソール上で会話しながらフェーズ、ターン数、観測タイプ、`p_want_talk` の推移を確認できます。
@@ -80,9 +80,9 @@ ui_display.py  ← 独立。logs 配下のみを読む
 依存関係の導入:
 
 ```bash
-python -m venv test_env
+python3 -m venv test_env
 source test_env/bin/activate
-pip install -r requirements.txt
+python3 -m pip install -r requirements.txt
 ```
 
 `.env` には以下を設定します。
@@ -102,9 +102,9 @@ AZURE_OPENAI_API_VERSION=
 既存ドキュメントでは以下のコマンドを前提にしています。
 
 ```bash
-python -m pytest test_bayes_v3.py test_ui_display.py -v
-python -m pytest test_bayes_v3.py::TestUpdatePosterior -v
-python -m pytest test_bayes_v3.py::TestUpdatePosterior::test_disclosure_raises_probability -v
+python3 -m pytest test_bayes_v3.py test_ui_display.py -v
+python3 -m pytest test_bayes_v3.py::TestUpdatePosterior -v
+python3 -m pytest test_bayes_v3.py::TestUpdatePosterior::test_disclosure_raises_probability -v
 ```
 
 テストでは Azure Speech SDK、`cv2`、OpenAI API をモック化し、ネットワーク不要で実行できる状態を維持してください。
