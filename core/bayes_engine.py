@@ -5,7 +5,7 @@ import logging
 import re
 from typing import Dict, Optional, Tuple
 
-from models import ActionType, ClassificationResult
+from core.models import ActionType, ClassificationResult
 
 
 # --- LLMプロンプト定数 ---

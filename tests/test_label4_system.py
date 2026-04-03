@@ -3,9 +3,9 @@
 import logging
 from types import SimpleNamespace
 
-from bayes_engine import CLASSIFY_ACTION_PROMPT, classify_action, judge_memory_signal, update_posterior
-from models import ActionType, Observation, Phase
-from phase_manager import PhaseManager
+from core.bayes_engine import CLASSIFY_ACTION_PROMPT, classify_action, judge_memory_signal, update_posterior
+from core.models import ActionType, Observation, Phase
+from core.phase_manager import PhaseManager
 
 
 def _make_client(response_text: str):

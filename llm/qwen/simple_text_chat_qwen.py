@@ -44,17 +44,17 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="repla
 
 load_dotenv()
 
-from models import ActionType, Observation, MemoryUpdate, ClassificationResult  # noqa: E402
-from bayes_engine import (  # noqa: E402
+from core.models import ActionType, Observation, MemoryUpdate, ClassificationResult  # noqa: E402
+from core.bayes_engine import (  # noqa: E402
     update_posterior as _update_posterior,
     classify_action as _classify_action,
     DEFAULT_LIKELIHOODS,
 )
-from conv_memory import (  # noqa: E402
+from core.conv_memory import (  # noqa: E402
     extract_recent_assistant_questions,
     update_conv_memory as _update_conv_memory,
 )
-from local_llm_utils import decode_local_llm_reply  # noqa: E402
+from core.local_llm_utils import decode_local_llm_reply  # noqa: E402
 
 
 class SimpleTextChatAgent:
@@ -196,7 +196,7 @@ class SimpleTextChatAgent:
         except Exception as e:
             self.logger.error("ローカルQwenモデルの読み込みに失敗: %s", e)
             print("エラー: ローカルQwenモデルの読み込みに失敗しました。")
-            print("先に `python3 download_qwen25_7b.py` を実行し、依存関係とGPU環境を確認してください。")
+            print("先に `python3 -m llm.qwen.download_qwen25_7b` を実行し、依存関係とGPU環境を確認してください。")
             print("必要に応じて `LOCAL_QWEN_DISABLE_4BIT=1` を付けて実行してください。")
             sys.exit(1)
 

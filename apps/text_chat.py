@@ -1,48 +1,42 @@
+"""テキストベース会話ツール: 話したい度（p_want_talk）の推定精度調査用"""
+
 import os
 import sys
 import io
-import time
-import base64
 import re
+import base64
 import logging
 from datetime import datetime
 from typing import Optional, List
 
 from dotenv import load_dotenv
-import azure.cognitiveservices.speech as speechsdk
 from openai import AzureOpenAI
-import cv2
 
 # 文字化け対策（Windowsターミナル想定）
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
 load_dotenv()
 
-# 後方互換: from bayes_v3 import ActionType 等を維持
-from models import ActionType, Phase, PhaseConfig, Observation, MemoryUpdate, ClassificationResult  # noqa: E402, F401
-from bayes_engine import (  # noqa: E402
+from core.models import ActionType, Phase, PhaseConfig, Observation, MemoryUpdate, ClassificationResult  # noqa: E402
+from core.bayes_engine import (  # noqa: E402
     update_posterior as _update_posterior,
     classify_action as _classify_action,
     judge_memory_signal as _judge_memory_signal,
     DEFAULT_LIKELIHOODS,
 )
-from phase_manager import PhaseManager, DEFAULT_PHASE_CONFIGS  # noqa: E402
-from conv_memory import (  # noqa: E402
+from core.phase_manager import PhaseManager  # noqa: E402
+from core.conv_memory import (  # noqa: E402
     detect_stop_intent,
     extract_recent_assistant_questions,
     update_conv_memory as _update_conv_memory,
 )
 
 
-# -----------------------------
-# エージェント本体
-# -----------------------------
-class MultimodalAgent:
+class TextChatAgent:
     """
-    目的:
-      - フェーズ（演出）を明示的に管理
-      - 観測（返答/沈黙/自己開示/回想）から P(話したい) を更新（ベイズ）
-      - P(話したい) とフェーズに応じて「質問する/しない」「戻る/進む」を制御
+    テキスト入力ベースの会話エージェント。
+    apps/bayes_v3.py の MultimodalAgent から音声I/O・UI同期・cv2依存を除去し、
+    話したい度の推移を調査しやすいステータス表示を追加したもの。
     """
 
     def __init__(self, image_path: str = "experiment_image.jpg"):
@@ -50,22 +44,17 @@ class MultimodalAgent:
         self.static_image_b64 = None
 
         # --- 1) 設定読み込み ---
-        self.speech_key = os.getenv("AZURE_SPEECH_KEY")
-        self.speech_region = os.getenv("AZURE_SPEECH_REGION")
         self.openai_key = os.getenv("AZURE_OPENAI_API_KEY")
         self.openai_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
         self.deployment_name = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
-        self.openai_api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
 
         missing = [k for k, v in [
-            ("AZURE_SPEECH_KEY", self.speech_key),
-            ("AZURE_SPEECH_REGION", self.speech_region),
             ("AZURE_OPENAI_API_KEY", self.openai_key),
             ("AZURE_OPENAI_ENDPOINT", self.openai_endpoint),
             ("AZURE_OPENAI_DEPLOYMENT_NAME", self.deployment_name),
         ] if not v]
         if missing:
-            print(f"❌ エラー: .env の設定が不足しています: {', '.join(missing)}")
+            print(f"エラー: .env の設定が不足しています: {', '.join(missing)}")
             sys.exit(1)
 
         # --- 2) ログ準備 ---
@@ -87,37 +76,17 @@ class MultimodalAgent:
         self.logger.info("会話ログ: %s", self.history_file)
         self.logger.info("分析用CSV: %s", self.analysis_csv)
 
-        # --- 3) Azure OpenAI / Speech 初期化 ---
+        # --- 3) Azure OpenAI 初期化 ---
         self.openai_client = AzureOpenAI(
             api_key=self.openai_key,
-            api_version=self.openai_api_version,
-            azure_endpoint=self.openai_endpoint
+            api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview"),
+            azure_endpoint=self.openai_endpoint,
         )
-
-        speech_config = speechsdk.SpeechConfig(subscription=self.speech_key, region=self.speech_region)
-        speech_config.speech_recognition_language = "ja-JP"
-        speech_config.speech_synthesis_voice_name = "ja-JP-NanamiNeural"
-
-        self.initial_silence_timeout_ms = 10000
-        self.segmentation_silence_timeout_ms = 1100
-        speech_config.set_property(
-            speechsdk.PropertyId.SpeechServiceConnection_InitialSilenceTimeoutMs,
-            str(self.initial_silence_timeout_ms)
-        )
-        speech_config.set_property(
-            speechsdk.PropertyId.Speech_SegmentationSilenceTimeoutMs,
-            str(self.segmentation_silence_timeout_ms)
-        )
-
-        audio_in = speechsdk.audio.AudioConfig(use_default_microphone=True)
-        audio_out = speechsdk.audio.AudioOutputConfig(use_default_speaker=True)
-        self.recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config, audio_config=audio_in)
-        self.synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=audio_out)
 
         # --- 4) フェーズマネージャ ---
         self.phase_mgr = PhaseManager(logger=self.logger)
 
-        # --- 5) 状態（内部状態 + 管理変数） ---
+        # --- 5) 状態 ---
         self.total_turns: int = 0
         self.p_want_talk: float = 0.5
 
@@ -130,60 +99,11 @@ class MultimodalAgent:
         self.force_end: bool = False
         self.max_total_turns: int = 15
 
-    # --- 後方互換プロパティ ---
-    @property
-    def phase(self) -> Phase:
-        return self.phase_mgr.phase
-
-    @phase.setter
-    def phase(self, value: Phase) -> None:
-        self.phase_mgr.phase = value
-
-    @property
-    def turn_in_phase(self) -> int:
-        return self.phase_mgr.turn_in_phase
-
-    @turn_in_phase.setter
-    def turn_in_phase(self, value: int) -> None:
-        self.phase_mgr.turn_in_phase = value
-
-    @property
-    def consecutive_silence(self) -> int:
-        return self.phase_mgr.consecutive_silence
-
-    @consecutive_silence.setter
-    def consecutive_silence(self, value: int) -> None:
-        self.phase_mgr.consecutive_silence = value
-
-    @property
-    def bridge_fail_count(self) -> int:
-        return self.phase_mgr.bridge_fail_count
-
-    @bridge_fail_count.setter
-    def bridge_fail_count(self, value: int) -> None:
-        self.phase_mgr.bridge_fail_count = value
-
-    @property
-    def deep_drop_count(self) -> int:
-        return self.phase_mgr.deep_drop_count
-
-    @deep_drop_count.setter
-    def deep_drop_count(self, value: int) -> None:
-        self.phase_mgr.deep_drop_count = value
-
-    @property
-    def phase_configs(self):
-        return self.phase_mgr.phase_configs
-
-    @phase_configs.setter
-    def phase_configs(self, value):
-        self.phase_mgr.phase_configs = value
-
     # -----------------------------
     # ログ・表示
     # -----------------------------
     def _setup_logger(self, ts: str) -> None:
-        self.logger = logging.getLogger("bayes_agent")
+        self.logger = logging.getLogger("text_chat_agent")
         self.logger.setLevel(logging.INFO)
 
         fmt = logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s", "%H:%M:%S")
@@ -208,55 +128,73 @@ class MultimodalAgent:
             pass
 
     # -----------------------------
-    # 音声 I/O
-    # -----------------------------
-    def speak(self, text: str) -> None:
-        if not text or not text.strip():
-            return
-        print(f"\n🤖 {text}")
-        self.append_to_history("AI", text)
-        try:
-            self.synthesizer.speak_text_async(text).get()
-        except Exception as e:
-            self.logger.warning("TTS失敗: %s", e)
-
-    def listen(self) -> Optional[str]:
-        wait_sec = self.initial_silence_timeout_ms // 1000
-        print(f"\n🎤 マイク待機（最大 {wait_sec}s）…", flush=True)
-        try:
-            result = self.recognizer.recognize_once_async().get()
-            if result.reason == speechsdk.ResultReason.RecognizedSpeech:
-                text = (result.text or "").strip()
-                if text:
-                    print(f"🧑 {text}")
-                    self.append_to_history("User", text)
-                    return text
-                return None
-            if result.reason == speechsdk.ResultReason.NoMatch:
-                print(f"🧑 （沈黙: {wait_sec}s 発話なし）")
-                return None
-            return None
-        except Exception as e:
-            self.logger.warning("STT失敗: %s", e)
-            return None
-
-    # -----------------------------
-    # 画像（実験用の静止画ロード）
+    # 画像（cv2不使用）
     # -----------------------------
     def _load_static_image(self) -> None:
         if not os.path.exists(self.static_image_path):
-            print(f"⚠️ 警告: 実験用画像が見つかりません ({self.static_image_path})")
+            print(f"警告: 実験用画像が見つかりません ({self.static_image_path})")
+            print("  → experiment_image.jpg をプロジェクトルートに配置してください")
             return
 
-        frame = cv2.imread(self.static_image_path)
-        if frame is None:
-            print(f"⚠️ 警告: 画像の読み込みに失敗しました ({self.static_image_path})")
-            return
+        try:
+            with open(self.static_image_path, "rb") as f:
+                self.static_image_b64 = base64.b64encode(f.read()).decode("utf-8")
+            print(f"実験用画像を読み込みました: {self.static_image_path}")
+        except Exception as e:
+            print(f"警告: 画像の読み込みに失敗しました ({self.static_image_path}): {e}")
 
-        ok, buffer = cv2.imencode(".jpg", frame)
-        if ok:
-            self.static_image_b64 = base64.b64encode(buffer).decode("utf-8")
-            print(f"✅ 実験用画像を読み込みました: {self.static_image_path}")
+    # -----------------------------
+    # テキスト I/O
+    # -----------------------------
+    def get_input(self) -> Optional[str]:
+        """テキスト入力を取得。空Enterは考え中（None）として扱う。"""
+        try:
+            text = input("\nあなた: ").strip()
+        except EOFError:
+            return None
+        if text:
+            self.append_to_history("User", text)
+            return text
+        print("  （考え中として待機します）")
+        return None
+
+    def output(self, text: str) -> None:
+        """AI応答を表示し、履歴に記録する。"""
+        if not text or not text.strip():
+            return
+        print(f"\nAI: {text}")
+        self.append_to_history("AI", text)
+
+    # -----------------------------
+    # 調査用ステータス表示
+    # -----------------------------
+    def display_status(
+        self,
+        action_type: ActionType,
+        prior: float,
+        posterior: float,
+        label_reason: Optional[str] = None,
+    ) -> None:
+        """フェーズ・ターン・観測・話したい度バーを表示する。"""
+        phase_name = self.phase_mgr.phase.value
+        turn_total = self.total_turns
+        turn_in_phase = self.phase_mgr.turn_in_phase
+
+        tag = action_type.value
+
+        # 話したい度バー（20文字幅）
+        bar_len = 20
+        filled = int(posterior * bar_len)
+        bar = "\u2588" * filled + "\u2591" * (bar_len - filled)
+
+        print(f"\n--- 状態 {'─' * 32}")
+        print(f"  フェーズ  : {phase_name}")
+        print(f"  ターン    : {turn_total}/{self.max_total_turns} (フェーズ内: {turn_in_phase})")
+        print(f"  観測      : {tag}")
+        if label_reason:
+            print(f"  判定理由  : {label_reason}")
+        print(f"  話したい度: {prior:.2f} → {posterior:.2f}  [{bar}]")
+        print(f"{'─' * 42}")
 
     # -----------------------------
     # 分析用データのロギング
@@ -274,7 +212,7 @@ class MultimodalAgent:
         try:
             with open(self.analysis_csv, "a", encoding="utf-8") as f:
                 f.write(
-                    f'{ts},{self.total_turns},{self.phase.name},{speaker},'
+                    f'{ts},{self.total_turns},{self.phase_mgr.phase.name},{speaker},'
                     f'{primary_label},"{safe_reason}",{self.p_want_talk:.2f},"{safe_text}"\n'
                 )
         except Exception as e:
@@ -289,7 +227,6 @@ class MultimodalAgent:
             prior, action_type,
             likelihoods=self.likelihoods,
         )
-        print(f"📊 P(話したい) 事前 {prior:.2f} → 観測 {action_type.value} → 事後 {self.p_want_talk:.2f}")
         return self.p_want_talk
 
     # -----------------------------
@@ -307,24 +244,15 @@ class MultimodalAgent:
     def transition_policy(self, obs: Observation) -> None:
         self.phase_mgr.transition_policy(obs, self.p_want_talk)
 
-    def _set_phase(self, phase: Phase, reason: str = "") -> None:
-        self.phase_mgr._set_phase(phase, reason)
-
     # -----------------------------
     # 会話メモ更新（委譲）
     # -----------------------------
-    def detect_stop_intent(self, user_text: Optional[str]) -> bool:
-        return detect_stop_intent(user_text)
-
-    def _extract_recent_assistant_questions(self, max_messages: int = 12) -> List[str]:
-        msgs = self.load_history_as_messages(max_messages=max_messages)
-        return extract_recent_assistant_questions(msgs)
-
     def update_conv_memory(self, user_text: Optional[str]) -> None:
         if not user_text:
             return
         history = self.load_history_as_messages(max_messages=12)
-        recent_questions = self._extract_recent_assistant_questions(max_messages=12)
+        msgs = self.load_history_as_messages(max_messages=12)
+        recent_questions = extract_recent_assistant_questions(msgs)
         self.conv_memory = _update_conv_memory(
             self.openai_client, self.deployment_name,
             self.conv_memory, user_text, history, recent_questions,
@@ -334,11 +262,8 @@ class MultimodalAgent:
     # -----------------------------
     # 返信生成（LLM）
     # -----------------------------
-    def _interaction_mode_instruction(self, obs: Observation) -> str:
-        return self.phase_mgr.get_interaction_mode_instruction(obs, self.p_want_talk)
-
     def think_and_reply(self, obs: Observation, base64_image: Optional[str], waiting_mode: bool = False) -> str:
-        cfg = self.phase_configs[self.phase]
+        cfg = self.phase_mgr.phase_configs[self.phase_mgr.phase]
 
         history = self.load_history_as_messages(max_messages=10)
 
@@ -349,7 +274,7 @@ class MultimodalAgent:
             do_not_ask_text = "（特になし）"
 
         initial_question_instruction = ""
-        if self.phase == Phase.SURROUNDINGS and not self.asked_initial_image_question:
+        if self.phase_mgr.phase == Phase.SURROUNDINGS and not self.asked_initial_image_question:
             #initial_question_instruction = "【重要】このターンの発言の最初 または 最後に、必ず「なぜフード付きのシャツを着た男性とパイプを持っている男性が話していると思いますか？」という趣旨の質問を組み込んでください。\n"
             self.asked_initial_image_question = True
 
@@ -362,6 +287,12 @@ class MultimodalAgent:
                 "【長さ】30〜70文字程度。\n"
             )
         length_instruction = "【長さ】30〜70文字程度。\n" if waiting_mode else "【長さ】60〜120文字程度。\n"
+
+        interaction_mode = (
+            waiting_instruction
+            if waiting_mode
+            else self.phase_mgr.get_interaction_mode_instruction(obs, self.p_want_talk)
+        )
 
         system_prompt = (
             "あなたは親しみやすい会話ロボットです。\n"
@@ -381,7 +312,7 @@ class MultimodalAgent:
             f"【現在フェーズ】{cfg.name.value}\n"
             f"{cfg.instruction}\n"
             f"{initial_question_instruction}"
-            f"{waiting_instruction if waiting_mode else self._interaction_mode_instruction(obs)}\n"
+            f"{interaction_mode}\n"
         )
 
         messages = [{"role": "system", "content": system_prompt}]
@@ -404,17 +335,15 @@ class MultimodalAgent:
         messages.append({"role": "user", "content": user_content})
 
         try:
-            print("🧠 生成中…", end="", flush=True)
             res = self.openai_client.chat.completions.create(
                 model=self.deployment_name,
                 messages=messages,
                 max_tokens=250,
-                temperature=0.7
+                temperature=0.7,
             )
-            print("\r" + " " * 18 + "\r", end="")
             return (res.choices[0].message.content or "").strip()
         except Exception as e:
-            self.logger.warning("生成LLM失敗: %s", e)
+            self.logger.warning("生成失敗: %s", e)
             return "ごめんなさい、少し調子が悪いみたいです。落ち着いたらまた話しかけてくださいね。"
 
     def load_history_as_messages(self, max_messages: int = 10) -> List[dict]:
@@ -444,91 +373,95 @@ class MultimodalAgent:
     # メインループ
     # -----------------------------
     def run(self) -> None:
-        self._banner("会話ロボット")
-
-        ui_flag = "ui_ready.flag"
-        # 前回セッションの残存フラグを削除し、新しいUI起動を確実に待つ
-        if os.path.exists(ui_flag):
-            try:
-                os.remove(ui_flag)
-            except OSError:
-                pass
-        print("⏳ UI起動待機中... (python3 -m streamlit run ui_display.py を実行してください)")
-        while not os.path.exists(ui_flag):
-            time.sleep(0.5)
-        print("✅ UIが起動しました。会話を開始します。")
-        try:
-            os.remove(ui_flag)
-        except OSError:
-            pass
+        self._banner("テキストベース会話ツール（話したい度 調査用）")
+        print("  空Enter = 考え中として待機 / Ctrl+C = 終了")
+        print(f"  最大ターン数: {self.max_total_turns}")
+        print(f"  ログ出力先: {self.run_dir}/")
+        if not self.static_image_b64:
+            print("  ※ 画像なしで動作します（画像フェーズはスキップされる可能性があります）")
+        print()
 
         initial_greeting = "こんにちは。たくさんお話しできたら嬉しいです！"
-        self.speak(initial_greeting)
+        self.output(initial_greeting)
         self.log_interaction("AI", initial_greeting, "")
 
-        while True:
-            user_text = self.listen()
-            if not user_text:
+        try:
+            while True:
+                user_text = self.get_input()
+                if not user_text:
+                    img_b64 = None
+                    if self.phase_mgr.phase != Phase.ENDING and self.phase_mgr.phase_configs[self.phase_mgr.phase].require_image:
+                        img_b64 = self.static_image_b64
+                    waiting_obs = Observation(user_text=None, action_type=ActionType.MINIMAL)
+                    wait_reply = self.think_and_reply(waiting_obs, img_b64, waiting_mode=True)
+                    self.output(wait_reply)
+                    if self.phase_mgr.phase == Phase.ENDING:
+                        print("\n会話を終了します。ログは以下に保存されています:")
+                        print(f"  {self.run_dir}/")
+                        break
+                    continue
+
+                self.total_turns += 1
+                self.phase_mgr.turn_in_phase += 1
+
+                self.update_conv_memory(user_text)
+
+                if self.conv_memory.stop_intent and self.phase_mgr.phase != Phase.ENDING:
+                    self.force_end = True
+                    self.phase_mgr._set_phase(Phase.ENDING, reason="ユーザー終了希望")
+
+                classification = self.classify_action(user_text)
+                action_type = classification.action_type
+
+                prior = float(self.p_want_talk)
+                self.update_posterior(action_type)
+                posterior = float(self.p_want_talk)
+
+                # 調査用ステータス表示
+                self.display_status(action_type, prior, posterior, classification.reason)
+
+                self.log_interaction("User", user_text, action_type.value, classification.reason or "")
+
+                memory_flag = False
+                note = None
+                if self.phase_mgr.phase in [Phase.BRIDGE, Phase.DEEP_DIVE]:
+                    memory_flag, note = self.judge_memory_signal(user_text)
+
+                obs = Observation(
+                    user_text=user_text,
+                    action_type=action_type,
+                    memory_flag=memory_flag,
+                    engagement_hint=note,
+                    label_reason=classification.reason,
+                )
+
+                if self.total_turns >= self.max_total_turns and self.phase_mgr.phase != Phase.ENDING:
+                    self.force_end = True
+                    self.phase_mgr._set_phase(Phase.ENDING, reason="最大ターン到達")
+
+                if not self.force_end:
+                    self.transition_policy(obs)
+
                 img_b64 = None
-                if self.phase != Phase.ENDING and self.phase_configs[self.phase].require_image:
+                if self.phase_mgr.phase != Phase.ENDING and self.phase_mgr.phase_configs[self.phase_mgr.phase].require_image:
                     img_b64 = self.static_image_b64
-                waiting_obs = Observation(user_text=None, action_type=ActionType.MINIMAL)
-                wait_reply = self.think_and_reply(waiting_obs, img_b64, waiting_mode=True)
-                self.speak(wait_reply)
-                if self.phase == Phase.ENDING:
+
+                reply = self.think_and_reply(obs, img_b64)
+                self.phase_mgr.notify_reply(reply)
+                self.output(reply)
+
+                self.log_interaction("AI", reply, "")
+
+                if self.phase_mgr.phase == Phase.ENDING:
+                    print("\n会話を終了します。ログは以下に保存されています:")
+                    print(f"  {self.run_dir}/")
                     break
-                continue
 
-            self.total_turns += 1
-            self.phase_mgr.turn_in_phase += 1
-
-            self.update_conv_memory(user_text)
-
-            if self.conv_memory.stop_intent and self.phase != Phase.ENDING:
-                self.force_end = True
-                self._set_phase(Phase.ENDING, reason="ユーザー終了希望")
-
-            classification = self.classify_action(user_text)
-            action_type = classification.action_type
-
-            self.update_posterior(action_type)
-
-            self.log_interaction("User", user_text, action_type.value, classification.reason or "")
-
-            memory_flag = False
-            note = None
-            if self.phase in [Phase.BRIDGE, Phase.DEEP_DIVE]:
-                memory_flag, note = self.judge_memory_signal(user_text)
-
-            obs = Observation(
-                user_text=user_text,
-                action_type=action_type,
-                memory_flag=memory_flag,
-                engagement_hint=note,
-                label_reason=classification.reason,
-            )
-
-            if self.total_turns >= self.max_total_turns and self.phase != Phase.ENDING:
-                self.force_end = True
-                self._set_phase(Phase.ENDING, reason="最大ターン到達")
-
-            if not self.force_end:
-                self.transition_policy(obs)
-
-            img_b64 = None
-            if self.phase != Phase.ENDING and self.phase_configs[self.phase].require_image:
-                img_b64 = self.static_image_b64
-
-            reply = self.think_and_reply(obs, img_b64)
-            self.phase_mgr.notify_reply(reply)
-            self.speak(reply)
-
-            self.log_interaction("AI", reply, "")
-
-            if self.phase == Phase.ENDING:
-                break
+        except KeyboardInterrupt:
+            print("\n\n中断しました。ログは以下に保存されています:")
+            print(f"  {self.run_dir}/")
 
 
 if __name__ == "__main__":
-    agent = MultimodalAgent(image_path="experiment_image.jpg")
+    agent = TextChatAgent(image_path="experiment_image.jpg")
     agent.run()

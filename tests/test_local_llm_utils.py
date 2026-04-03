@@ -1,6 +1,6 @@
 """ローカルLLMの返答抽出ロジックのテスト。"""
 
-from local_llm_utils import decode_local_llm_reply, extract_gpt_oss_final_text
+from core.local_llm_utils import decode_local_llm_reply, extract_gpt_oss_final_text
 
 
 class DummyTokenizer:

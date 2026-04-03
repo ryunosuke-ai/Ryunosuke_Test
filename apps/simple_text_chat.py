@@ -25,36 +25,21 @@ except ModuleNotFoundError:
     print("例: python3 -m pip install openai")
     sys.exit(1)
 
-try:
-    import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-except ModuleNotFoundError:
-    print("エラー: `transformers` / `torch` が見つかりません。")
-    print("依存関係をインストールしてから再実行してください。")
-    print("例: python3 -m pip install transformers torch accelerate sentencepiece")
-    sys.exit(1)
-
-try:
-    from transformers import BitsAndBytesConfig
-except Exception:
-    BitsAndBytesConfig = None
-
 # 文字化け対策（Windowsターミナル想定）
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
 load_dotenv()
 
-from models import ActionType, Observation, MemoryUpdate, ClassificationResult  # noqa: E402
-from bayes_engine import (  # noqa: E402
+from core.models import ActionType, Observation, MemoryUpdate, ClassificationResult  # noqa: E402
+from core.bayes_engine import (  # noqa: E402
     update_posterior as _update_posterior,
     classify_action as _classify_action,
     DEFAULT_LIKELIHOODS,
 )
-from conv_memory import (  # noqa: E402
+from core.conv_memory import (  # noqa: E402
     extract_recent_assistant_questions,
     update_conv_memory as _update_conv_memory,
 )
-from local_llm_utils import decode_local_llm_reply  # noqa: E402
 
 
 class SimpleTextChatAgent:
@@ -64,7 +49,7 @@ class SimpleTextChatAgent:
     会話履歴を参照して盛り上がる質問を生成する。
     """
 
-    PHASE_LABEL = "SIMPLE_CHAT_GPT_OSS"
+    PHASE_LABEL = "SIMPLE_CHAT"
     FLOW_WARMUP = "WARMUP"
     FLOW_BRIDGE = "BRIDGE"
     FLOW_REMINISCENCE = "REMINISCENCE"
@@ -81,17 +66,12 @@ class SimpleTextChatAgent:
 
     BACK_TO_WARMUP_ABS = 0.35
     DELTA_WINDOW_TURNS = 3
-    DEFAULT_MODEL_ID = "openai/gpt-oss-20b"
-    LOCAL_MAX_NEW_TOKENS = 180
-    LOCAL_TEMPERATURE = 0.7
-    LOCAL_TOP_P = 0.9
 
     def __init__(self):
         # --- 1) 設定読み込み ---
         self.openai_key = os.getenv("AZURE_OPENAI_API_KEY")
         self.openai_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
         self.deployment_name = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
-        self.local_model_id = os.getenv("LOCAL_GPT_OSS_MODEL_ID", self.DEFAULT_MODEL_ID)
 
         missing = [k for k, v in [
             ("AZURE_OPENAI_API_KEY", self.openai_key),
@@ -120,26 +100,14 @@ class SimpleTextChatAgent:
         self.logger.info("会話ログ: %s", self.history_file)
         self.logger.info("分析用CSV: %s", self.analysis_csv)
 
-        # --- 3) Azure OpenAI 初期化（分類・会話メモ更新で使用） ---
+        # --- 3) Azure OpenAI 初期化 ---
         self.openai_client = AzureOpenAI(
             api_key=self.openai_key,
             api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview"),
             azure_endpoint=self.openai_endpoint,
         )
-        self.logger.info("分類・会話メモ更新は Azure OpenAI を使用します。")
 
-        # --- 4) ローカルgpt-oss 初期化（返信生成で使用） ---
-        if not torch.cuda.is_available():
-            print("エラー: CUDA対応GPUが見つかりません。")
-            print("gpt-oss-20b のローカル実行には GPU 環境が必要です。")
-            print("`nvidia-smi` と `python3 -c 'import torch; print(torch.cuda.is_available())'` を確認してください。")
-            sys.exit(1)
-        self.local_device = "cuda"
-        self.tokenizer = None
-        self.local_model = None
-        self._load_local_gpt_oss()
-
-        # --- 5) 状態 ---
+        # --- 4) 状態 ---
         self.total_turns: int = 0
         self.p_want_talk: float = 0.5
         self.likelihoods = DEFAULT_LIKELIHOODS
@@ -151,54 +119,6 @@ class SimpleTextChatAgent:
         self.last_transition_turn: int = 0
         self.low_engagement_streak: int = 0
         self.p_history: Deque[float] = deque([self.p_want_talk], maxlen=6)
-
-    def _load_local_gpt_oss(self) -> None:
-        """ローカルgpt-ossモデルを読み込む。"""
-        try:
-            self.tokenizer = AutoTokenizer.from_pretrained(self.local_model_id, trust_remote_code=True)
-            enable_4bit = os.getenv("LOCAL_GPT_OSS_ENABLE_4BIT", "0") == "1"
-            loaded_with_4bit = False
-
-            if BitsAndBytesConfig is not None and enable_4bit:
-                try:
-                    quant_config = BitsAndBytesConfig(
-                        load_in_4bit=True,
-                        bnb_4bit_use_double_quant=True,
-                        bnb_4bit_quant_type="nf4",
-                        bnb_4bit_compute_dtype=torch.float16,
-                    )
-                    self.local_model = AutoModelForCausalLM.from_pretrained(
-                        self.local_model_id,
-                        quantization_config=quant_config,
-                        device_map="auto",
-                        trust_remote_code=True,
-                    )
-                    loaded_with_4bit = True
-                    self.logger.info("gpt-ossを4bit量子化で読み込みました。")
-                except Exception as quant_error:
-                    self.logger.warning("4bit読み込みに失敗したため、FP16/BF16へフォールバックします: %s", quant_error)
-
-            if not loaded_with_4bit:
-                use_bf16 = torch.cuda.is_bf16_supported()
-                load_dtype = torch.bfloat16 if use_bf16 else torch.float16
-                self.local_model = AutoModelForCausalLM.from_pretrained(
-                    self.local_model_id,
-                    dtype=load_dtype,
-                    device_map="auto",
-                    trust_remote_code=True,
-                )
-                self.logger.info(
-                    "gpt-ossを%sで読み込みました（4bit未使用）。",
-                    "BF16" if use_bf16 else "FP16",
-                )
-            self.local_model.eval()
-            self.logger.info("ローカルgpt-ossモデル読み込み完了: %s", self.local_model_id)
-        except Exception as e:
-            self.logger.error("ローカルgpt-ossモデルの読み込みに失敗: %s", e)
-            print("エラー: ローカルgpt-ossモデルの読み込みに失敗しました。")
-            print("先に `python3 download_gpt_oss_20b.py` を実行し、依存関係とGPU環境を確認してください。")
-            print("4bitを使う場合は `LOCAL_GPT_OSS_ENABLE_4BIT=1` を付けて実行してください。")
-            sys.exit(1)
 
     # -----------------------------
     # ログ・表示
@@ -561,37 +481,15 @@ class SimpleTextChatAgent:
         messages.append({"role": "user", "content": user_content})
 
         try:
-            model_inputs = self.tokenizer.apply_chat_template(
-                messages,
-                tokenize=True,
-                add_generation_prompt=True,
-                return_tensors="pt",
-                return_dict=True,
+            res = self.openai_client.chat.completions.create(
+                model=self.deployment_name,
+                messages=messages,
+                max_tokens=250,
+                temperature=0.7,
             )
-            model_inputs = {k: v.to(self.local_device) for k, v in model_inputs.items()}
-            input_ids = model_inputs["input_ids"]
-
-            if "attention_mask" not in model_inputs:
-                model_inputs["attention_mask"] = torch.ones_like(input_ids, device=self.local_device)
-            with torch.no_grad():
-                output_ids = self.local_model.generate(
-                    **model_inputs,
-                    max_new_tokens=self.LOCAL_MAX_NEW_TOKENS,
-                    do_sample=True,
-                    temperature=self.LOCAL_TEMPERATURE,
-                    top_p=self.LOCAL_TOP_P,
-                    repetition_penalty=1.05,
-                    eos_token_id=self.tokenizer.eos_token_id,
-                    pad_token_id=self.tokenizer.eos_token_id,
-                )
-
-            generated = output_ids[0][input_ids.shape[1]:]
-            reply = decode_local_llm_reply(self.tokenizer, generated)
-            if not reply:
-                return "少し考えがまとまりませんでした。よければ、もう一度だけ聞かせてください。"
-            return reply
+            return (res.choices[0].message.content or "").strip()
         except Exception as e:
-            self.logger.warning("ローカルgpt-oss生成失敗: %s", e)
+            self.logger.warning("生成失敗: %s", e)
             return "ごめんなさい、少し調子が悪いみたいです。落ち着いたらまた話しかけてくださいね。"
 
     def load_history_as_messages(self, max_messages: int = 10) -> List[dict]:
@@ -621,7 +519,7 @@ class SimpleTextChatAgent:
     # メインループ
     # -----------------------------
     def run(self) -> None:
-        self._banner("単純会話ツール gpt-oss版（フェーズ遷移なし）")
+        self._banner("単純会話ツール（フェーズ遷移なし）")
         print("  空Enter = 考え中として待機 / Ctrl+C = 終了")
         print(f"  最大ターン数: {self.max_total_turns}")
         print(f"  ログ出力先: {self.run_dir}/")
