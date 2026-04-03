@@ -4,6 +4,7 @@ import re
 from typing import Any
 
 
+GPT_OSS_FINAL_PREFIX = "<|channel|>final<|message|>"
 GPT_OSS_FINAL_MARKER = "<|start|>assistant<|channel|>final<|message|>"
 GPT_OSS_END_MARKERS = ("<|return|>", "<|end|>")
 
@@ -51,3 +52,13 @@ def decode_local_llm_reply(tokenizer: Any, generated_ids: Any) -> str:
 
     fallback_text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
     return _cleanup_fallback_text(fallback_text)
+
+
+def build_gpt_oss_final_prompt(tokenizer: Any, messages: list[dict]) -> str:
+    """gpt-oss の生成開始位置を final チャンネルへ固定したプロンプトを作る。"""
+    prompt = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    return prompt + GPT_OSS_FINAL_PREFIX

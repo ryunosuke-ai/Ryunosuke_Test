@@ -54,7 +54,7 @@ from core.conv_memory import (  # noqa: E402
     extract_recent_assistant_questions,
     update_conv_memory as _update_conv_memory,
 )
-from core.local_llm_utils import decode_local_llm_reply  # noqa: E402
+from core.local_llm_utils import build_gpt_oss_final_prompt, decode_local_llm_reply  # noqa: E402
 
 
 class SimpleTextChatAgent:
@@ -561,12 +561,10 @@ class SimpleTextChatAgent:
         messages.append({"role": "user", "content": user_content})
 
         try:
-            model_inputs = self.tokenizer.apply_chat_template(
-                messages,
-                tokenize=True,
-                add_generation_prompt=True,
+            prompt_text = build_gpt_oss_final_prompt(self.tokenizer, messages)
+            model_inputs = self.tokenizer(
+                prompt_text,
                 return_tensors="pt",
-                return_dict=True,
             )
             model_inputs = {k: v.to(self.local_device) for k, v in model_inputs.items()}
             input_ids = model_inputs["input_ids"]
