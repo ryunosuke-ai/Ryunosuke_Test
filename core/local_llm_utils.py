@@ -7,6 +7,7 @@ from typing import Any
 GPT_OSS_FINAL_PREFIX = "<|channel|>final<|message|>"
 GPT_OSS_FINAL_MARKER = "<|start|>assistant<|channel|>final<|message|>"
 GPT_OSS_END_MARKERS = ("<|return|>", "<|end|>")
+GPT_OSS_INLINE_END_MARKERS = ("<|return|>", "<|start|>", "<|end|>")
 
 
 def _normalize_reply_text(text: str) -> str:
@@ -49,6 +50,14 @@ def decode_local_llm_reply(tokenizer: Any, generated_ids: Any) -> str:
     final_text = extract_gpt_oss_final_text(raw_text)
     if final_text:
         return final_text
+
+    inline_text = raw_text
+    inline_end_positions = [inline_text.find(marker) for marker in GPT_OSS_INLINE_END_MARKERS if marker in inline_text]
+    if inline_end_positions:
+        inline_text = inline_text[:min(inline_end_positions)]
+    inline_text = _normalize_reply_text(inline_text)
+    if inline_text:
+        return inline_text
 
     fallback_text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
     return _cleanup_fallback_text(fallback_text)

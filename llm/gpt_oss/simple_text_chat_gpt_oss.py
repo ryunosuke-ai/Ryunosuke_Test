@@ -583,7 +583,11 @@ class SimpleTextChatAgent:
                     temperature=self.LOCAL_TEMPERATURE,
                     top_p=self.LOCAL_TOP_P,
                     repetition_penalty=1.05,
-                    eos_token_id=self.tokenizer.eos_token_id,
+                    eos_token_id=[
+                        self.tokenizer.eos_token_id,
+                        self.tokenizer.convert_tokens_to_ids("<|start|>"),
+                        self.tokenizer.convert_tokens_to_ids("<|end|>"),
+                    ],
                     pad_token_id=self.tokenizer.eos_token_id,
                 )
 

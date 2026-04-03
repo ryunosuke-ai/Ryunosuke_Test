@@ -74,6 +74,22 @@ def test_decode_local_llm_reply_keeps_normal_model_output():
     assert result == "今日はのんびりできてよかったですね。お茶は飲まれましたか？"
 
 
+def test_decode_local_llm_reply_trims_trailing_next_message_tokens():
+    tokenizer = DummyTokenizer(
+        with_special_tokens=(
+            "わかったよ。気になることがあればいつでも話せるからね。"
+            "<|start|>assistant<|channel|>analysis<|message|>internal reasoning"
+        ),
+        without_special_tokens=(
+            "わかったよ。気になることがあればいつでも話せるからね。assistantanalysisinternal reasoning"
+        ),
+    )
+
+    result = decode_local_llm_reply(tokenizer, [1, 2, 3])
+
+    assert result == "わかったよ。気になることがあればいつでも話せるからね。"
+
+
 def test_build_gpt_oss_final_prompt_appends_final_channel_marker():
     tokenizer = DummyTokenizer(with_special_tokens="", without_special_tokens="")
 
