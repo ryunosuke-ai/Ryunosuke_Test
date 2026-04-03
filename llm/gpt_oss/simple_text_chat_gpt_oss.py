@@ -42,6 +42,10 @@ except Exception:
 # 文字化け対策（Windowsターミナル想定）
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
 load_dotenv()
 
 from core.models import ActionType, Observation, MemoryUpdate, ClassificationResult  # noqa: E402
