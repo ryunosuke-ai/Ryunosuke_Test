@@ -11,7 +11,7 @@ GPT_OSS_INLINE_END_MARKERS = ("<|return|>", "<|start|>", "<|end|>")
 QWEN_THINK_BLOCK_PATTERN = re.compile(r"<think>\s*.*?\s*</think>\s*", re.DOTALL)
 QWEN_SPECIAL_TOKEN_PATTERN = re.compile(r"<\|[^>]+?\|>")
 QWEN_REASONING_HEAD_PATTERN = re.compile(
-    r"^\s*(Thinking Process:|The user is asking\b|Analyze the Request:|Wait, looking at\b)",
+    r"^\s*(Thinking Process:|Drafting:|Reasoning:|The user is asking\b|Analyze the Request:|Wait, looking at\b)",
     re.IGNORECASE,
 )
 QWEN_ANSWER_MARKER_PATTERN = re.compile(
@@ -81,6 +81,9 @@ def extract_qwen_final_text(raw_text: str, show_thinking: bool = False) -> str:
     cleaned = _strip_qwen_special_tokens(raw_text)
     if show_thinking:
         return _normalize_reply_text(cleaned)
+
+    if "<think>" in raw_text and "</think>" not in raw_text:
+        return ""
 
     cleaned = QWEN_THINK_BLOCK_PATTERN.sub(" ", cleaned).strip()
     if not cleaned:
@@ -160,14 +163,13 @@ def clean_qwen_thinking_output(text: str, show_thinking: bool = False) -> str:
     return extract_qwen_final_text(text, show_thinking=show_thinking)
 
 
-def build_qwen_display_fallback_text(raw_text: str) -> str:
-    """Qwen3.5 の生出力を、最終表示用の最後の手段として整える。"""
+def qwen_think_block_closed(raw_text: str) -> bool:
+    """Qwen3.5 の生出力で think ブロックが閉じているかを返す。"""
     if not raw_text:
-        return ""
-
-    cleaned = _strip_qwen_special_tokens(raw_text)
-    cleaned = re.sub(r"^\s*(Final Answer:|Final Response:|Response:|Assistant:|回答:|返答:)\s*", "", cleaned, flags=re.IGNORECASE)
-    return _normalize_reply_text(cleaned)
+        return False
+    if "<think>" not in raw_text:
+        return not bool(QWEN_REASONING_HEAD_PATTERN.match(_strip_qwen_special_tokens(raw_text)))
+    return "</think>" in raw_text
 
 
 def decode_qwen_local_llm_reply(tokenizer: Any, generated_ids: Any, show_thinking: bool = False) -> str:

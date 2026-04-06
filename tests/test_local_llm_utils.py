@@ -2,13 +2,13 @@
 
 from core.local_llm_utils import (
     build_gpt_oss_final_prompt,
-    build_qwen_display_fallback_text,
     build_qwen_generation_prompt,
     clean_qwen_thinking_output,
     decode_local_llm_reply,
     decode_qwen_local_llm_reply,
     extract_gpt_oss_final_text,
     extract_qwen_final_text,
+    qwen_think_block_closed,
 )
 
 
@@ -177,6 +177,14 @@ def test_extract_qwen_final_text_keeps_japanese_answer_after_reasoning_prefix():
     assert result == "日本語でお話しできますよ。さっきは表示が崩れてしまいました。"
 
 
+def test_extract_qwen_final_text_returns_empty_when_think_block_is_not_closed():
+    raw = "<think>考えています。\nまだ途中です。"
+
+    result = extract_qwen_final_text(raw)
+
+    assert result == ""
+
+
 def test_decode_qwen_local_llm_reply_uses_fallback_decode_when_needed():
     tokenizer = DummyTokenizer(
         with_special_tokens="",
@@ -188,20 +196,20 @@ def test_decode_qwen_local_llm_reply_uses_fallback_decode_when_needed():
     assert result == "元気そうで何よりです。最近、楽しかったことはありましたか？"
 
 
-def test_build_qwen_display_fallback_text_keeps_reasoning_when_no_final_answer_exists():
-    raw = "Thinking Process:\n\n1. Analyze the Request.\n2. Continue carefully."
+def test_qwen_think_block_closed_returns_false_for_reasoning_only_output():
+    raw = "Drafting:\n\n候補を整理しています。"
 
-    result = build_qwen_display_fallback_text(raw)
+    result = qwen_think_block_closed(raw)
 
-    assert result == "Thinking Process: 1. Analyze the Request. 2. Continue carefully."
+    assert result is False
 
 
-def test_build_qwen_display_fallback_text_removes_special_tokens_and_answer_prefix():
-    raw = "Assistant: こんにちは。<|im_end|>"
+def test_qwen_think_block_closed_returns_true_when_think_is_closed():
+    raw = "<think>考えています。</think>\n\nこんにちは。"
 
-    result = build_qwen_display_fallback_text(raw)
+    result = qwen_think_block_closed(raw)
 
-    assert result == "こんにちは。"
+    assert result is True
 
 
 class DummyBrokenProcessorTokenizer:

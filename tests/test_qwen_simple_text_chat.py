@@ -98,9 +98,12 @@ def _make_agent(with_special_texts, without_special_texts=None, outputs=None):
     agent.enable_thinking = True
     agent.show_thinking = False
     agent.local_device = "cuda"
-    agent.LOCAL_MAX_NEW_TOKENS = 180
-    agent.LOCAL_TEMPERATURE = 0.7
-    agent.LOCAL_TOP_P = 0.9
+    agent.local_max_new_tokens = 180
+    agent.local_temperature = 1.0
+    agent.local_top_p = 0.95
+    agent.local_top_k = 20
+    agent.local_min_p = 0.0
+    agent.local_repetition_penalty = 1.0
     agent.tokenizer = FakeTokenizer(with_special_texts, without_special_texts)
     output_count = len(outputs) if outputs is not None else max(len(with_special_texts), 1)
     agent.local_model = FakeModel(outputs or [[4, 5, 6]] * output_count)
@@ -145,21 +148,22 @@ def test_think_and_reply_retries_when_first_output_is_reasoning_only():
 def test_think_and_reply_returns_raw_output_when_retry_still_has_no_final_answer():
     agent = _make_agent(
         with_special_texts=[
-            "Thinking Process:\n\n1. Analyze first.",
-            "Thinking Process:\n\n1. Analyze first.",
-            "Thinking Process:\n\n2. Still reasoning only.",
-            "Thinking Process:\n\n2. Still reasoning only.",
+            "<think>Thinking Process:\n\n1. Analyze first.",
+            "<think>Thinking Process:\n\n1. Analyze first.",
+            "<think>Thinking Process:\n\n2. Still reasoning only.",
+            "<think>Thinking Process:\n\n2. Still reasoning only.",
         ],
         without_special_texts=[
-            "Thinking Process:\n\n1. Analyze first.",
-            "Thinking Process:\n\n2. Still reasoning only.",
+            "<think>Thinking Process:\n\n1. Analyze first.",
+            "<think>Thinking Process:\n\n2. Still reasoning only.",
         ],
         outputs=[[4], [5]],
     )
+    agent.local_max_new_tokens = 1
     obs = type("Obs", (), {"user_text": "こんにちは！", "action_type": type("Action", (), {"value": "MINIMAL"})()})()
 
     result = agent.think_and_reply(obs)
 
-    assert result == "Thinking Process: 2. Still reasoning only."
+    assert result == "少し長く考えています。もう一度だけ話しかけてください。"
     assert agent.local_model.calls == 2
-    assert any("生返答をそのまま表示します" in record[1] for record in agent.logger.records if record[0] == "warning")
+    assert any("max_new_tokens に到達しました" in record[1] for record in agent.logger.records if record[0] == "warning")

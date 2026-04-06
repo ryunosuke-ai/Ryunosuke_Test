@@ -46,9 +46,9 @@ load_dotenv()
 from core.models import ActionType, MemoryUpdate, Observation  # noqa: E402
 from core.bayes_engine import DEFAULT_LIKELIHOODS  # noqa: E402
 from core.local_llm_utils import (  # noqa: E402
-    build_qwen_display_fallback_text,
     build_qwen_generation_prompt,
     decode_qwen_local_llm_reply,
+    qwen_think_block_closed,
 )
 from llm.gpt_oss.simple_text_chat_gpt_oss import SimpleTextChatAgent as GptOssSimpleTextChatAgent  # noqa: E402
 
@@ -72,6 +72,24 @@ def _read_env_flag(primary_name: str, default: bool = False, legacy_names: tuple
     return str(value).strip().lower() in TRUE_VALUES
 
 
+def _read_env_int(primary_name: str, default: int, legacy_names: tuple[str, ...] = ()) -> int:
+    """整数の環境変数を解釈する。"""
+    value = _read_env_value(primary_name, str(default), legacy_names=legacy_names)
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _read_env_float(primary_name: str, default: float, legacy_names: tuple[str, ...] = ()) -> float:
+    """小数の環境変数を解釈する。"""
+    value = _read_env_value(primary_name, str(default), legacy_names=legacy_names)
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
 class SimpleTextChatAgent(GptOssSimpleTextChatAgent):
     """
     フェーズ遷移を使わないテキスト会話エージェント。
@@ -82,6 +100,18 @@ class SimpleTextChatAgent(GptOssSimpleTextChatAgent):
     DEFAULT_MODEL_ID = "Qwen/Qwen3.5-27B"
     BANNER_TITLE = "単純会話ツール Qwen3.5-27B版（フェーズ遷移なし）"
     MAX_GENERATION_ATTEMPTS = 2
+    DEFAULT_THINKING_MAX_NEW_TOKENS = 32768
+    DEFAULT_NON_THINKING_MAX_NEW_TOKENS = 1024
+    DEFAULT_THINKING_TEMPERATURE = 1.0
+    DEFAULT_THINKING_TOP_P = 0.95
+    DEFAULT_THINKING_TOP_K = 20
+    DEFAULT_THINKING_MIN_P = 0.0
+    DEFAULT_THINKING_REPETITION_PENALTY = 1.0
+    DEFAULT_INSTRUCT_TEMPERATURE = 0.7
+    DEFAULT_INSTRUCT_TOP_P = 0.8
+    DEFAULT_INSTRUCT_TOP_K = 20
+    DEFAULT_INSTRUCT_MIN_P = 0.0
+    DEFAULT_INSTRUCT_REPETITION_PENALTY = 1.0
 
     def __init__(self):
         # --- 1) 設定読み込み ---
@@ -102,6 +132,34 @@ class SimpleTextChatAgent(GptOssSimpleTextChatAgent):
             "LOCAL_QWEN_SHOW_THINKING",
             default=False,
             legacy_names=("LOCAL_QWEN35_SHOW_THINKING",),
+        )
+        default_max_new_tokens = (
+            self.DEFAULT_THINKING_MAX_NEW_TOKENS if self.enable_thinking else self.DEFAULT_NON_THINKING_MAX_NEW_TOKENS
+        )
+        self.local_max_new_tokens = _read_env_int("LOCAL_QWEN_MAX_NEW_TOKENS", default_max_new_tokens)
+        self.local_temperature = _read_env_float(
+            "LOCAL_QWEN_TEMPERATURE",
+            self.DEFAULT_THINKING_TEMPERATURE if self.enable_thinking else self.DEFAULT_INSTRUCT_TEMPERATURE,
+        )
+        self.local_top_p = _read_env_float(
+            "LOCAL_QWEN_TOP_P",
+            self.DEFAULT_THINKING_TOP_P if self.enable_thinking else self.DEFAULT_INSTRUCT_TOP_P,
+        )
+        self.local_top_k = _read_env_int(
+            "LOCAL_QWEN_TOP_K",
+            self.DEFAULT_THINKING_TOP_K if self.enable_thinking else self.DEFAULT_INSTRUCT_TOP_K,
+        )
+        self.local_min_p = _read_env_float(
+            "LOCAL_QWEN_MIN_P",
+            self.DEFAULT_THINKING_MIN_P if self.enable_thinking else self.DEFAULT_INSTRUCT_MIN_P,
+        )
+        self.local_repetition_penalty = _read_env_float(
+            "LOCAL_QWEN_REPETITION_PENALTY",
+            (
+                self.DEFAULT_THINKING_REPETITION_PENALTY
+                if self.enable_thinking
+                else self.DEFAULT_INSTRUCT_REPETITION_PENALTY
+            ),
         )
 
         missing = [k for k, v in [
@@ -246,6 +304,15 @@ class SimpleTextChatAgent(GptOssSimpleTextChatAgent):
             self.local_model.eval()
             self.logger.info("ローカルQwen3.5-27Bモデル読み込み完了: %s", self.local_model_id)
             self.logger.info("Qwen3.5 thinkingモード: %s", "有効" if self.enable_thinking else "無効")
+            self.logger.info(
+                "Qwen生成設定: max_new_tokens=%s temperature=%.2f top_p=%.2f top_k=%s min_p=%.2f repetition_penalty=%.2f",
+                self.local_max_new_tokens,
+                self.local_temperature,
+                self.local_top_p,
+                self.local_top_k,
+                self.local_min_p,
+                self.local_repetition_penalty,
+            )
         except Exception as e:
             self.logger.error("ローカルQwen3.5-27Bモデルの読み込みに失敗: %s", e)
             print("エラー: ローカルQwen3.5-27Bモデルの読み込みに失敗しました。")
@@ -291,8 +358,8 @@ class SimpleTextChatAgent(GptOssSimpleTextChatAgent):
             )
         return base_instruction
 
-    def _generate_once(self, messages: list[dict], strict_output: bool = False) -> tuple[str, str]:
-        """Qwen で1回生成し、抽出本文と生返答を返す。"""
+    def _generate_once(self, messages: list[dict], strict_output: bool = False) -> tuple[str, str, bool, bool, int]:
+        """Qwen で1回生成し、抽出本文と状態を返す。"""
         prompt_text = self._build_qwen_prompt_text(messages)
         model_inputs = self._build_model_inputs(prompt_text)
         input_ids = model_inputs["input_ids"]
@@ -302,24 +369,35 @@ class SimpleTextChatAgent(GptOssSimpleTextChatAgent):
         with torch.no_grad():
             output_ids = self.local_model.generate(
                 **model_inputs,
-                max_new_tokens=self.LOCAL_MAX_NEW_TOKENS,
+                max_new_tokens=self.local_max_new_tokens,
                 do_sample=True,
-                temperature=self.LOCAL_TEMPERATURE,
-                top_p=self.LOCAL_TOP_P,
-                repetition_penalty=1.05,
+                temperature=self.local_temperature,
+                top_p=self.local_top_p,
+                top_k=self.local_top_k,
+                min_p=self.local_min_p,
+                repetition_penalty=self.local_repetition_penalty,
                 eos_token_id=self.tokenizer.eos_token_id,
                 pad_token_id=self.tokenizer.eos_token_id,
             )
 
         generated = output_ids[0][input_ids.shape[1]:]
+        generated_len = len(generated)
         raw_text = self.tokenizer.decode(generated, skip_special_tokens=False).strip()
         reply = self._decode_qwen_reply(generated)
+        think_closed = qwen_think_block_closed(raw_text)
+        hit_max_new_tokens = generated_len >= self.local_max_new_tokens
 
-        if strict_output:
-            self.logger.warning("Qwen3.5-27B生出力（再生成）: %r", raw_text)
-        else:
-            self.logger.warning("Qwen3.5-27B生出力: %r", raw_text)
-        return reply, raw_text
+        prefix = "Qwen3.5-27B生出力（再生成）" if strict_output else "Qwen3.5-27B生出力"
+        self.logger.warning(
+            "%s: generated_len=%s max_new_tokens=%s think_closed=%s hit_max_new_tokens=%s raw=%r",
+            prefix,
+            generated_len,
+            self.local_max_new_tokens,
+            think_closed,
+            hit_max_new_tokens,
+            raw_text,
+        )
+        return reply, raw_text, think_closed, hit_max_new_tokens, generated_len
 
     def think_and_reply(self, obs: Observation, waiting_mode: bool = False, ending_mode: bool = False) -> str:
         history = self.load_history_as_messages(max_messages=10)
@@ -384,9 +462,12 @@ class SimpleTextChatAgent(GptOssSimpleTextChatAgent):
         messages.append({"role": "user", "content": user_content})
 
         try:
-            reply, raw_text = self._generate_once(messages, strict_output=False)
+            reply, raw_text, think_closed, hit_max_new_tokens, _ = self._generate_once(messages, strict_output=False)
             if reply:
                 return reply
+
+            if hit_max_new_tokens and not think_closed:
+                self.logger.warning("Qwen3.5-27Bは think ブロック未完了のまま max_new_tokens に到達しました。")
 
             retry_messages = list(messages)
             retry_messages[0] = {
@@ -397,15 +478,19 @@ class SimpleTextChatAgent(GptOssSimpleTextChatAgent):
                 ),
             }
             self.logger.warning("Qwen3.5-27Bの本文抽出に失敗したため、thinking ON のまま再生成します。")
-            retry_reply, retry_raw_text = self._generate_once(retry_messages, strict_output=True)
+            retry_reply, retry_raw_text, retry_think_closed, retry_hit_max_new_tokens, _ = self._generate_once(
+                retry_messages,
+                strict_output=True,
+            )
             if retry_reply:
                 return retry_reply
 
-            fallback_text = build_qwen_display_fallback_text(retry_raw_text or raw_text)
-            if fallback_text:
-                self.logger.warning("Qwen3.5-27Bの本文抽出に再度失敗したため、生返答をそのまま表示します。")
-                return fallback_text
-            return build_qwen_display_fallback_text(raw_text)
+            if retry_hit_max_new_tokens and not retry_think_closed:
+                self.logger.warning("Qwen3.5-27Bは再生成でも think ブロック未完了のまま max_new_tokens に到達しました。")
+            self.logger.warning(
+                "Qwen3.5-27Bの最終応答を取得できませんでした。reasoning はログのみへ残し、ユーザー表示は最終応答待ちメッセージへ切り替えます。"
+            )
+            return "少し長く考えています。もう一度だけ話しかけてください。"
         except Exception as e:
             self.logger.warning("ローカルQwen3.5-27B生成失敗: %s", e)
             return "ごめんなさい、少し調子が悪いみたいです。落ち着いたらまた話しかけてくださいね。"
@@ -416,6 +501,7 @@ class SimpleTextChatAgent(GptOssSimpleTextChatAgent):
         print(f"  最大ターン数: {self.max_total_turns}")
         print(f"  ローカルモデル: {self.local_model_id}")
         print(f"  thinkingモード: {'ON' if self.enable_thinking else 'OFF'}")
+        print(f"  max_new_tokens: {self.local_max_new_tokens}")
         print(f"  ログ出力先: {self.run_dir}/")
         print()
 
