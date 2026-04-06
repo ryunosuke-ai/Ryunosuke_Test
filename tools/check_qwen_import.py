@@ -1,2 +1,4 @@
-from transformers import Qwen2ForCausalLM
-print("Qwen2ForCausalLM import: OK")
+from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
+
+print("AutoProcessor import: OK")
+print("Qwen3_5ForConditionalGeneration import: OK")

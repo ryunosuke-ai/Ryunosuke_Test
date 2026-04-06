@@ -60,7 +60,7 @@ SETUP → INTRO → SURROUNDINGS → BRIDGE → DEEP_DIVE → ENDING
 - `core/conv_memory.py`: 会話要約、繰り返し防止、終了意思判定
 - `core/models.py`: 共通データ型定義
 - `llm/gpt_oss/simple_text_chat_gpt_oss.py`: gpt-oss 版簡易テキスト会話
-- `llm/qwen/simple_text_chat_qwen.py`: Qwen 版簡易テキスト会話
+- `llm/qwen/simple_text_chat_qwen35.py`: Qwen3.5 版簡易テキスト会話
 - `docs/SYSTEM_OVERVIEW.md`: システム仕様の詳細
 - `CLAUDE.md`: 作業ルールと補足資料
 

@@ -27,11 +27,11 @@ except ModuleNotFoundError:
 
 try:
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-except ModuleNotFoundError:
+    from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
+except ImportError:
     print("エラー: `transformers` / `torch` が見つかりません。")
-    print("依存関係をインストールしてから再実行してください。")
-    print("例: python3 -m pip install transformers torch accelerate sentencepiece")
+    print("Qwen3.5 に対応した依存関係をインストールしてから再実行してください。")
+    print("例: python3 -m pip install -r requirements.txt")
     sys.exit(1)
 
 try:
@@ -58,7 +58,7 @@ from core.conv_memory import (  # noqa: E402
     extract_recent_assistant_questions,
     update_conv_memory as _update_conv_memory,
 )
-from core.local_llm_utils import decode_local_llm_reply  # noqa: E402
+from core.local_llm_utils import clean_qwen_thinking_output, decode_local_llm_reply  # noqa: E402
 
 
 class SimpleTextChatAgent:
@@ -68,7 +68,7 @@ class SimpleTextChatAgent:
     会話履歴を参照して盛り上がる質問を生成する。
     """
 
-    PHASE_LABEL = "SIMPLE_CHAT_QWEN"
+    PHASE_LABEL = "SIMPLE_CHAT_QWEN35"
     FLOW_WARMUP = "WARMUP"
     FLOW_BRIDGE = "BRIDGE"
     FLOW_REMINISCENCE = "REMINISCENCE"
@@ -85,7 +85,7 @@ class SimpleTextChatAgent:
 
     BACK_TO_WARMUP_ABS = 0.35
     DELTA_WINDOW_TURNS = 3
-    DEFAULT_MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
+    DEFAULT_MODEL_ID = "Qwen/Qwen3.5-9B"
     LOCAL_MAX_NEW_TOKENS = 180
     LOCAL_TEMPERATURE = 0.7
     LOCAL_TOP_P = 0.9
@@ -95,7 +95,12 @@ class SimpleTextChatAgent:
         self.openai_key = os.getenv("AZURE_OPENAI_API_KEY")
         self.openai_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
         self.deployment_name = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
-        self.local_model_id = os.getenv("LOCAL_QWEN_MODEL_ID", self.DEFAULT_MODEL_ID)
+        self.local_model_id = (
+            os.getenv("LOCAL_QWEN35_MODEL_ID")
+            or os.getenv("LOCAL_QWEN_MODEL_ID")
+            or self.DEFAULT_MODEL_ID
+        )
+        self.show_thinking = os.getenv("LOCAL_QWEN35_SHOW_THINKING", "0") == "1"
 
         missing = [k for k, v in [
             ("AZURE_OPENAI_API_KEY", self.openai_key),
@@ -132,13 +137,14 @@ class SimpleTextChatAgent:
         )
         self.logger.info("分類・会話メモ更新は Azure OpenAI を使用します。")
 
-        # --- 4) ローカルQwen 初期化（返信生成で使用） ---
+        # --- 4) ローカルQwen3.5 初期化（返信生成で使用） ---
         if not torch.cuda.is_available():
             print("エラー: CUDA対応GPUが見つかりません。")
-            print("Qwen 2.5 7B のローカル実行には GPU 環境が必要です。")
+            print("Qwen3.5-9B のローカル実行には GPU 環境が必要です。")
             print("`nvidia-smi` と `python3 -c 'import torch; print(torch.cuda.is_available())'` を確認してください。")
             sys.exit(1)
         self.local_device = "cuda"
+        self.processor = None
         self.tokenizer = None
         self.local_model = None
         self._load_local_qwen()
@@ -157,10 +163,15 @@ class SimpleTextChatAgent:
         self.p_history: Deque[float] = deque([self.p_want_talk], maxlen=6)
 
     def _load_local_qwen(self) -> None:
-        """ローカルQwenモデルを読み込む。"""
+        """ローカルQwen3.5モデルを読み込む。"""
         try:
-            self.tokenizer = AutoTokenizer.from_pretrained(self.local_model_id, trust_remote_code=True)
-            force_no_4bit = os.getenv("LOCAL_QWEN_DISABLE_4BIT", "0") == "1"
+            self.processor = AutoProcessor.from_pretrained(self.local_model_id, trust_remote_code=True)
+            self.tokenizer = getattr(self.processor, "tokenizer", self.processor)
+            force_no_4bit = (
+                os.getenv("LOCAL_QWEN35_DISABLE_4BIT")
+                or os.getenv("LOCAL_QWEN_DISABLE_4BIT")
+                or "0"
+            ) == "1"
             loaded_with_4bit = False
 
             if BitsAndBytesConfig is not None and not force_no_4bit:
@@ -171,37 +182,37 @@ class SimpleTextChatAgent:
                         bnb_4bit_quant_type="nf4",
                         bnb_4bit_compute_dtype=torch.float16,
                     )
-                    self.local_model = AutoModelForCausalLM.from_pretrained(
+                    self.local_model = Qwen3_5ForConditionalGeneration.from_pretrained(
                         self.local_model_id,
                         quantization_config=quant_config,
                         device_map="auto",
                         trust_remote_code=True,
                     )
                     loaded_with_4bit = True
-                    self.logger.info("Qwenを4bit量子化で読み込みました。")
+                    self.logger.info("Qwen3.5を4bit量子化で読み込みました。")
                 except Exception as quant_error:
                     self.logger.warning("4bit読み込みに失敗したため、FP16/BF16へフォールバックします: %s", quant_error)
 
             if not loaded_with_4bit:
                 use_bf16 = torch.cuda.is_bf16_supported()
                 load_dtype = torch.bfloat16 if use_bf16 else torch.float16
-                self.local_model = AutoModelForCausalLM.from_pretrained(
+                self.local_model = Qwen3_5ForConditionalGeneration.from_pretrained(
                     self.local_model_id,
-                    dtype=load_dtype,
+                    torch_dtype=load_dtype,
                     device_map="auto",
                     trust_remote_code=True,
                 )
                 self.logger.info(
-                    "Qwenを%sで読み込みました（4bit未使用）。",
+                    "Qwen3.5を%sで読み込みました（4bit未使用）。",
                     "BF16" if use_bf16 else "FP16",
                 )
             self.local_model.eval()
-            self.logger.info("ローカルQwenモデル読み込み完了: %s", self.local_model_id)
+            self.logger.info("ローカルQwen3.5モデル読み込み完了: %s", self.local_model_id)
         except Exception as e:
-            self.logger.error("ローカルQwenモデルの読み込みに失敗: %s", e)
-            print("エラー: ローカルQwenモデルの読み込みに失敗しました。")
-            print("先に `python3 -m llm.qwen.download_qwen25_7b` を実行し、依存関係とGPU環境を確認してください。")
-            print("必要に応じて `LOCAL_QWEN_DISABLE_4BIT=1` を付けて実行してください。")
+            self.logger.error("ローカルQwen3.5モデルの読み込みに失敗: %s", e)
+            print("エラー: ローカルQwen3.5モデルの読み込みに失敗しました。")
+            print("先に `python3 -m llm.qwen.download_qwen35_9b` を実行し、依存関係とGPU環境を確認してください。")
+            print("必要に応じて `LOCAL_QWEN35_DISABLE_4BIT=1` を付けて実行してください。")
             sys.exit(1)
 
     # -----------------------------
@@ -565,12 +576,13 @@ class SimpleTextChatAgent:
         messages.append({"role": "user", "content": user_content})
 
         try:
-            model_inputs = self.tokenizer.apply_chat_template(
+            model_inputs = self.processor.apply_chat_template(
                 messages,
                 tokenize=True,
                 add_generation_prompt=True,
                 return_tensors="pt",
                 return_dict=True,
+                enable_thinking=True,
             )
             model_inputs = {k: v.to(self.local_device) for k, v in model_inputs.items()}
             input_ids = model_inputs["input_ids"]
@@ -591,11 +603,12 @@ class SimpleTextChatAgent:
 
             generated = output_ids[0][input_ids.shape[1]:]
             reply = decode_local_llm_reply(self.tokenizer, generated)
+            reply = clean_qwen_thinking_output(reply, show_thinking=self.show_thinking)
             if not reply:
                 return "少し考えがまとまりませんでした。よければ、もう一度だけ聞かせてください。"
             return reply
         except Exception as e:
-            self.logger.warning("ローカルQwen生成失敗: %s", e)
+            self.logger.warning("ローカルQwen3.5生成失敗: %s", e)
             return "ごめんなさい、少し調子が悪いみたいです。落ち着いたらまた話しかけてくださいね。"
 
     def load_history_as_messages(self, max_messages: int = 10) -> List[dict]:
@@ -625,7 +638,7 @@ class SimpleTextChatAgent:
     # メインループ
     # -----------------------------
     def run(self) -> None:
-        self._banner("単純会話ツール Qwen版（フェーズ遷移なし）")
+        self._banner("単純会話ツール Qwen3.5版（フェーズ遷移なし）")
         print("  空Enter = 考え中として待機 / Ctrl+C = 終了")
         print(f"  最大ターン数: {self.max_total_turns}")
         print(f"  ログ出力先: {self.run_dir}/")

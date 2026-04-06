@@ -1,6 +1,11 @@
 """ローカルLLMの返答抽出ロジックのテスト。"""
 
-from core.local_llm_utils import build_gpt_oss_final_prompt, decode_local_llm_reply, extract_gpt_oss_final_text
+from core.local_llm_utils import (
+    build_gpt_oss_final_prompt,
+    clean_qwen_thinking_output,
+    decode_local_llm_reply,
+    extract_gpt_oss_final_text,
+)
 
 
 class DummyTokenizer:
@@ -96,3 +101,19 @@ def test_build_gpt_oss_final_prompt_appends_final_channel_marker():
     result = build_gpt_oss_final_prompt(tokenizer, [{"role": "user", "content": "こんにちは"}])
 
     assert result == "<|start|>assistant<|channel|>final<|message|>"
+
+
+def test_clean_qwen_thinking_output_hides_thinking_by_default():
+    raw = "<think>\n内部で考えています。\n</think>\n\n今日はのんびりできましたか？"
+
+    result = clean_qwen_thinking_output(raw)
+
+    assert result == "今日はのんびりできましたか？"
+
+
+def test_clean_qwen_thinking_output_can_keep_thinking_for_debug():
+    raw = "<think>考え中</think>\n今日はのんびりできましたか？"
+
+    result = clean_qwen_thinking_output(raw, show_thinking=True)
+
+    assert result == "<think>考え中</think> 今日はのんびりできましたか？"

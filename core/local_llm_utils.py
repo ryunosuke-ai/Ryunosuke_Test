@@ -8,6 +8,7 @@ GPT_OSS_FINAL_PREFIX = "<|channel|>final<|message|>"
 GPT_OSS_FINAL_MARKER = "<|start|>assistant<|channel|>final<|message|>"
 GPT_OSS_END_MARKERS = ("<|return|>", "<|end|>")
 GPT_OSS_INLINE_END_MARKERS = ("<|return|>", "<|start|>", "<|end|>")
+QWEN_THINK_BLOCK_PATTERN = re.compile(r"<think>\s*.*?\s*</think>\s*", re.DOTALL)
 
 
 def _normalize_reply_text(text: str) -> str:
@@ -71,3 +72,12 @@ def build_gpt_oss_final_prompt(tokenizer: Any, messages: list[dict]) -> str:
         add_generation_prompt=True,
     )
     return prompt + GPT_OSS_FINAL_PREFIX
+
+
+def clean_qwen_thinking_output(text: str, show_thinking: bool = False) -> str:
+    """Qwen3.5 の think ブロックを必要に応じて除去する。"""
+    if not text:
+        return ""
+    if show_thinking:
+        return _normalize_reply_text(text)
+    return _normalize_reply_text(QWEN_THINK_BLOCK_PATTERN.sub("", text))
