@@ -117,3 +117,45 @@ def test_clean_qwen_thinking_output_can_keep_thinking_for_debug():
     result = clean_qwen_thinking_output(raw, show_thinking=True)
 
     assert result == "<think>考え中</think> 今日はのんびりできましたか？"
+
+
+class DummyBrokenProcessorTokenizer:
+    """Qwen3.5 の不安定経路を模したスタブ。"""
+
+    eos_token_id = 99
+
+    def __init__(self):
+        self.last_prompt = None
+
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False, enable_thinking=False):
+        if tokenize:
+            raise TypeError("string indices must be integers")
+        assert add_generation_prompt is True
+        assert enable_thinking is True
+        self.last_prompt = "\n".join(f"{m['role']}:{m['content']}" for m in messages)
+        return self.last_prompt
+
+    def __call__(self, prompt, return_tensors="pt"):
+        assert return_tensors == "pt"
+        assert prompt == self.last_prompt
+        return {"input_ids": [[1, 2, 3]], "attention_mask": [[1, 1, 1]]}
+
+
+def test_qwen_text_path_can_tokenize_after_chat_template_without_processor_fast_path():
+    tokenizer = DummyBrokenProcessorTokenizer()
+    messages = [
+        {"role": "system", "content": "会話してください"},
+        {"role": "user", "content": "こんにちは"},
+    ]
+
+    prompt = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=True,
+    )
+    model_inputs = tokenizer(prompt, return_tensors="pt")
+
+    assert prompt == "system:会話してください\nuser:こんにちは"
+    assert model_inputs["input_ids"] == [[1, 2, 3]]
+    assert model_inputs["attention_mask"] == [[1, 1, 1]]

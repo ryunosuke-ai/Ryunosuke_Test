@@ -576,14 +576,17 @@ class SimpleTextChatAgent:
         messages.append({"role": "user", "content": user_content})
 
         try:
-            model_inputs = self.processor.apply_chat_template(
+            # Qwen3.5-9B では text-only の通常メッセージに対して
+            # processor.apply_chat_template(..., tokenize=True) が
+            # TypeError("string indices must be integers") で落ちるため、
+            # テンプレート展開とトークナイズを分離して回避する。
+            prompt_text = self.tokenizer.apply_chat_template(
                 messages,
-                tokenize=True,
+                tokenize=False,
                 add_generation_prompt=True,
-                return_tensors="pt",
-                return_dict=True,
                 enable_thinking=True,
             )
+            model_inputs = self.tokenizer(prompt_text, return_tensors="pt")
             model_inputs = {k: v.to(self.local_device) for k, v in model_inputs.items()}
             input_ids = model_inputs["input_ids"]
 
