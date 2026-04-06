@@ -320,12 +320,14 @@ class SimpleTextChatAgent(GptOssSimpleTextChatAgent):
             print("4bitを使う場合は `LOCAL_QWEN_ENABLE_4BIT=1` を付けて実行してください。")
             sys.exit(1)
 
-    def _build_qwen_prompt_text(self, messages: list[dict]) -> str:
+    def _build_qwen_prompt_text(self, messages: list[dict], enable_thinking: bool | None = None) -> str:
         """Qwen 用のチャットプロンプトを組み立てる。"""
+        if enable_thinking is None:
+            enable_thinking = self.enable_thinking
         return build_qwen_generation_prompt(
             self.tokenizer,
             messages,
-            enable_thinking=self.enable_thinking,
+            enable_thinking=enable_thinking,
         )
 
     def _build_model_inputs(self, prompt_text: str) -> dict:
@@ -358,9 +360,17 @@ class SimpleTextChatAgent(GptOssSimpleTextChatAgent):
             )
         return base_instruction
 
-    def _generate_once(self, messages: list[dict], strict_output: bool = False) -> tuple[str, str, bool, bool, int]:
+    def _generate_once(
+        self,
+        messages: list[dict],
+        strict_output: bool = False,
+        enable_thinking: bool | None = None,
+    ) -> tuple[str, str, bool, bool, int]:
         """Qwen で1回生成し、抽出本文と状態を返す。"""
-        prompt_text = self._build_qwen_prompt_text(messages)
+        if enable_thinking is None:
+            enable_thinking = self.enable_thinking
+
+        prompt_text = self._build_qwen_prompt_text(messages, enable_thinking=enable_thinking)
         model_inputs = self._build_model_inputs(prompt_text)
         input_ids = model_inputs["input_ids"]
 
@@ -387,10 +397,12 @@ class SimpleTextChatAgent(GptOssSimpleTextChatAgent):
         think_closed = qwen_think_block_closed(raw_text)
         hit_max_new_tokens = generated_len >= self.local_max_new_tokens
 
+        mode_label = "thinking=ON" if enable_thinking else "thinking=OFF"
         prefix = "Qwen3.5-27B生出力（再生成）" if strict_output else "Qwen3.5-27B生出力"
         self.logger.warning(
-            "%s: generated_len=%s max_new_tokens=%s think_closed=%s hit_max_new_tokens=%s raw=%r",
+            "%s: mode=%s generated_len=%s max_new_tokens=%s think_closed=%s hit_max_new_tokens=%s raw=%r",
             prefix,
+            mode_label,
             generated_len,
             self.local_max_new_tokens,
             think_closed,
@@ -477,10 +489,19 @@ class SimpleTextChatAgent(GptOssSimpleTextChatAgent):
                     self._build_output_control_instruction(strict_output=True),
                 ),
             }
-            self.logger.warning("Qwen3.5-27Bの本文抽出に失敗したため、thinking ON のまま再生成します。")
+            retry_enable_thinking = self.enable_thinking and not (
+                hit_max_new_tokens and not think_closed
+            )
+            if retry_enable_thinking:
+                self.logger.warning("Qwen3.5-27Bの本文抽出に失敗したため、thinking ON のまま再生成します。")
+            else:
+                self.logger.warning(
+                    "Qwen3.5-27Bの本文抽出に失敗したため、再生成では thinking を無効化して最終回答のみを取得します。"
+                )
             retry_reply, retry_raw_text, retry_think_closed, retry_hit_max_new_tokens, _ = self._generate_once(
                 retry_messages,
                 strict_output=True,
+                enable_thinking=retry_enable_thinking,
             )
             if retry_reply:
                 return retry_reply

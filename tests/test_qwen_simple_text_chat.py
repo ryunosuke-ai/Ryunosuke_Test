@@ -167,3 +167,30 @@ def test_think_and_reply_returns_raw_output_when_retry_still_has_no_final_answer
     assert result == "少し長く考えています。もう一度だけ話しかけてください。"
     assert agent.local_model.calls == 2
     assert any("max_new_tokens に到達しました" in record[1] for record in agent.logger.records if record[0] == "warning")
+
+
+def test_think_and_reply_retries_with_thinking_off_when_think_block_is_truncated():
+    agent = _make_agent(
+        with_special_texts=[
+            "<think>Thinking Process:\n\n1. Analyze first.",
+            "<think>Thinking Process:\n\n1. Analyze first.",
+            "こんにちは。今日はゆっくりできていますか？<|im_end|>",
+            "こんにちは。今日はゆっくりできていますか？",
+        ],
+        without_special_texts=[
+            "<think>Thinking Process:\n\n1. Analyze first.",
+            "こんにちは。今日はゆっくりできていますか？",
+        ],
+        outputs=[[4], [5]],
+    )
+    agent.local_max_new_tokens = 1
+    obs = type("Obs", (), {"user_text": "こんにちは！", "action_type": type("Action", (), {"value": "MINIMAL"})()})()
+
+    result = agent.think_and_reply(obs)
+
+    assert result == "こんにちは。今日はゆっくりできていますか？"
+    assert agent.local_model.calls == 2
+    assert len(agent.tokenizer.template_calls) == 2
+    assert agent.tokenizer.template_calls[0]["enable_thinking"] is True
+    assert agent.tokenizer.template_calls[1]["enable_thinking"] is False
+    assert any("thinking を無効化" in record[1] for record in agent.logger.records if record[0] == "warning")
