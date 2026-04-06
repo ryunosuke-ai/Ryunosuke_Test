@@ -167,14 +167,14 @@ class SimpleTextChatAgent:
         try:
             self.processor = AutoProcessor.from_pretrained(self.local_model_id, trust_remote_code=True)
             self.tokenizer = getattr(self.processor, "tokenizer", self.processor)
-            force_no_4bit = (
-                os.getenv("LOCAL_QWEN35_DISABLE_4BIT")
-                or os.getenv("LOCAL_QWEN_DISABLE_4BIT")
+            enable_4bit = (
+                os.getenv("LOCAL_QWEN35_ENABLE_4BIT")
+                or os.getenv("LOCAL_QWEN_ENABLE_4BIT")
                 or "0"
             ) == "1"
             loaded_with_4bit = False
 
-            if BitsAndBytesConfig is not None and not force_no_4bit:
+            if BitsAndBytesConfig is not None and enable_4bit:
                 try:
                     quant_config = BitsAndBytesConfig(
                         load_in_4bit=True,
@@ -192,6 +192,8 @@ class SimpleTextChatAgent:
                     self.logger.info("Qwen3.5を4bit量子化で読み込みました。")
                 except Exception as quant_error:
                     self.logger.warning("4bit読み込みに失敗したため、FP16/BF16へフォールバックします: %s", quant_error)
+            elif enable_4bit and BitsAndBytesConfig is None:
+                self.logger.warning("BitsAndBytesConfig が利用できないため、4bit量子化をスキップしてFP16/BF16を使います。")
 
             if not loaded_with_4bit:
                 use_bf16 = torch.cuda.is_bf16_supported()
@@ -212,7 +214,7 @@ class SimpleTextChatAgent:
             self.logger.error("ローカルQwen3.5モデルの読み込みに失敗: %s", e)
             print("エラー: ローカルQwen3.5モデルの読み込みに失敗しました。")
             print("先に `python3 -m llm.qwen.download_qwen35_9b` を実行し、依存関係とGPU環境を確認してください。")
-            print("必要に応じて `LOCAL_QWEN35_DISABLE_4BIT=1` を付けて実行してください。")
+            print("4bit量子化を試す場合のみ `LOCAL_QWEN35_ENABLE_4BIT=1` を付けて実行してください。")
             sys.exit(1)
 
     # -----------------------------

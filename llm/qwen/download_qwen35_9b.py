@@ -34,9 +34,14 @@ def parse_args() -> argparse.Namespace:
         help="取得するリビジョン（任意）",
     )
     parser.add_argument(
+        "--enable-4bit",
+        action="store_true",
+        help="4bit量子化を明示的に有効化する",
+    )
+    parser.add_argument(
         "--disable-4bit",
         action="store_true",
-        help="4bit量子化を使わず、BF16/FP16で取得する",
+        help=argparse.SUPPRESS,
     )
     return parser.parse_args()
 
@@ -58,8 +63,9 @@ def main() -> None:
         revision=args.revision,
         trust_remote_code=True,
     )
+    use_4bit = args.enable_4bit and not args.disable_4bit
     loaded_with_4bit = False
-    if BitsAndBytesConfig is not None and not args.disable_4bit:
+    if BitsAndBytesConfig is not None and use_4bit:
         try:
             quant_config = BitsAndBytesConfig(
                 load_in_4bit=True,
@@ -78,6 +84,8 @@ def main() -> None:
             print("4bit量子化で取得しました。")
         except Exception as e:
             print(f"警告: 4bit量子化での取得に失敗しました。FP16/BF16へ切り替えます: {e}")
+    elif use_4bit and BitsAndBytesConfig is None:
+        print("警告: BitsAndBytesConfig が利用できないため、4bit量子化を使わずFP16/BF16で取得します。")
 
     if not loaded_with_4bit:
         use_bf16 = torch.cuda.is_bf16_supported()
