@@ -39,8 +39,9 @@ try:
 except Exception:
     BitsAndBytesConfig = None
 
-# 文字化け対策（Windowsターミナル想定）
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+# 文字化け対策（通常端末のみ）
+if sys.stdout is sys.__stdout__ and hasattr(sys.stdout, "buffer"):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if PROJECT_ROOT not in sys.path:

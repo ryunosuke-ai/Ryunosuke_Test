@@ -160,6 +160,16 @@ def clean_qwen_thinking_output(text: str, show_thinking: bool = False) -> str:
     return extract_qwen_final_text(text, show_thinking=show_thinking)
 
 
+def build_qwen_display_fallback_text(raw_text: str) -> str:
+    """Qwen3.5 の生出力を、最終表示用の最後の手段として整える。"""
+    if not raw_text:
+        return ""
+
+    cleaned = _strip_qwen_special_tokens(raw_text)
+    cleaned = re.sub(r"^\s*(Final Answer:|Final Response:|Response:|Assistant:|回答:|返答:)\s*", "", cleaned, flags=re.IGNORECASE)
+    return _normalize_reply_text(cleaned)
+
+
 def decode_qwen_local_llm_reply(tokenizer: Any, generated_ids: Any, show_thinking: bool = False) -> str:
     """Qwen3.5 の生成結果から特殊トークンや推論を除いた返答本文を抽出する。"""
     raw_text = tokenizer.decode(generated_ids, skip_special_tokens=False).strip()

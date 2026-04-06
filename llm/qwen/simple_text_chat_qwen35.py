@@ -46,6 +46,7 @@ load_dotenv()
 from core.models import ActionType, MemoryUpdate, Observation  # noqa: E402
 from core.bayes_engine import DEFAULT_LIKELIHOODS  # noqa: E402
 from core.local_llm_utils import (  # noqa: E402
+    build_qwen_display_fallback_text,
     build_qwen_generation_prompt,
     decode_qwen_local_llm_reply,
 )
@@ -80,6 +81,7 @@ class SimpleTextChatAgent(GptOssSimpleTextChatAgent):
     PHASE_LABEL = "SIMPLE_CHAT_QWEN35"
     DEFAULT_MODEL_ID = "Qwen/Qwen3.5-27B"
     BANNER_TITLE = "単純会話ツール Qwen3.5-27B版（フェーズ遷移なし）"
+    MAX_GENERATION_ATTEMPTS = 2
 
     def __init__(self):
         # --- 1) 設定読み込み ---
@@ -275,6 +277,50 @@ class SimpleTextChatAgent(GptOssSimpleTextChatAgent):
             show_thinking=self.show_thinking,
         )
 
+    def _build_output_control_instruction(self, strict_output: bool = False) -> str:
+        """thinking ON 時でも最終回答だけを返すための制約を返す。"""
+        base_instruction = (
+            "【出力制御】内部では十分に考えてよいが、ユーザーに見せる出力は最終回答本文のみとする。\n"
+            "【出力制御】Thinking Process、分析、推論、<think>、内部メモは出力しない。\n"
+            "【出力制御】必ず自然な日本語の返答本文を1つ以上出す。\n"
+        )
+        if strict_output:
+            return (
+                base_instruction
+                + "【出力制御】今回は前回の出力が思考文に偏ったため、説明や分析ではなく、ユーザー向け返答本文だけを直ちに出力する。\n"
+            )
+        return base_instruction
+
+    def _generate_once(self, messages: list[dict], strict_output: bool = False) -> tuple[str, str]:
+        """Qwen で1回生成し、抽出本文と生返答を返す。"""
+        prompt_text = self._build_qwen_prompt_text(messages)
+        model_inputs = self._build_model_inputs(prompt_text)
+        input_ids = model_inputs["input_ids"]
+
+        if "attention_mask" not in model_inputs:
+            model_inputs["attention_mask"] = torch.ones_like(input_ids, device=self.local_device)
+        with torch.no_grad():
+            output_ids = self.local_model.generate(
+                **model_inputs,
+                max_new_tokens=self.LOCAL_MAX_NEW_TOKENS,
+                do_sample=True,
+                temperature=self.LOCAL_TEMPERATURE,
+                top_p=self.LOCAL_TOP_P,
+                repetition_penalty=1.05,
+                eos_token_id=self.tokenizer.eos_token_id,
+                pad_token_id=self.tokenizer.eos_token_id,
+            )
+
+        generated = output_ids[0][input_ids.shape[1]:]
+        raw_text = self.tokenizer.decode(generated, skip_special_tokens=False).strip()
+        reply = self._decode_qwen_reply(generated)
+
+        if strict_output:
+            self.logger.warning("Qwen3.5-27B生出力（再生成）: %r", raw_text)
+        else:
+            self.logger.warning("Qwen3.5-27B生出力: %r", raw_text)
+        return reply, raw_text
+
     def think_and_reply(self, obs: Observation, waiting_mode: bool = False, ending_mode: bool = False) -> str:
         history = self.load_history_as_messages(max_messages=10)
 
@@ -322,6 +368,7 @@ class SimpleTextChatAgent(GptOssSimpleTextChatAgent):
             "【繰り返し禁止（すでに確認済み）】\n"
             f"{do_not_ask_text}\n"
             "【重要】上の『繰り返し禁止』に含まれる内容は、言い換えても再質問しない。\n"
+            f"{self._build_output_control_instruction(strict_output=False)}"
             f"{reminiscence_examples}"
             f"{interaction_mode}\n"
         )
@@ -337,31 +384,28 @@ class SimpleTextChatAgent(GptOssSimpleTextChatAgent):
         messages.append({"role": "user", "content": user_content})
 
         try:
-            prompt_text = self._build_qwen_prompt_text(messages)
-            model_inputs = self._build_model_inputs(prompt_text)
-            input_ids = model_inputs["input_ids"]
+            reply, raw_text = self._generate_once(messages, strict_output=False)
+            if reply:
+                return reply
 
-            if "attention_mask" not in model_inputs:
-                model_inputs["attention_mask"] = torch.ones_like(input_ids, device=self.local_device)
-            with torch.no_grad():
-                output_ids = self.local_model.generate(
-                    **model_inputs,
-                    max_new_tokens=self.LOCAL_MAX_NEW_TOKENS,
-                    do_sample=True,
-                    temperature=self.LOCAL_TEMPERATURE,
-                    top_p=self.LOCAL_TOP_P,
-                    repetition_penalty=1.05,
-                    eos_token_id=self.tokenizer.eos_token_id,
-                    pad_token_id=self.tokenizer.eos_token_id,
-                )
+            retry_messages = list(messages)
+            retry_messages[0] = {
+                "role": "system",
+                "content": system_prompt.replace(
+                    self._build_output_control_instruction(strict_output=False),
+                    self._build_output_control_instruction(strict_output=True),
+                ),
+            }
+            self.logger.warning("Qwen3.5-27Bの本文抽出に失敗したため、thinking ON のまま再生成します。")
+            retry_reply, retry_raw_text = self._generate_once(retry_messages, strict_output=True)
+            if retry_reply:
+                return retry_reply
 
-            generated = output_ids[0][input_ids.shape[1]:]
-            reply = self._decode_qwen_reply(generated)
-            if not reply:
-                raw_text = self.tokenizer.decode(generated, skip_special_tokens=False).strip()
-                self.logger.warning("Qwen3.5-27B生出力: %r", raw_text)
-                return "少し考えがまとまりませんでした。よければ、もう一度だけ聞かせてください。"
-            return reply
+            fallback_text = build_qwen_display_fallback_text(retry_raw_text or raw_text)
+            if fallback_text:
+                self.logger.warning("Qwen3.5-27Bの本文抽出に再度失敗したため、生返答をそのまま表示します。")
+                return fallback_text
+            return build_qwen_display_fallback_text(raw_text)
         except Exception as e:
             self.logger.warning("ローカルQwen3.5-27B生成失敗: %s", e)
             return "ごめんなさい、少し調子が悪いみたいです。落ち着いたらまた話しかけてくださいね。"

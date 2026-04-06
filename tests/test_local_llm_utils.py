@@ -2,6 +2,7 @@
 
 from core.local_llm_utils import (
     build_gpt_oss_final_prompt,
+    build_qwen_display_fallback_text,
     build_qwen_generation_prompt,
     clean_qwen_thinking_output,
     decode_local_llm_reply,
@@ -185,6 +186,22 @@ def test_decode_qwen_local_llm_reply_uses_fallback_decode_when_needed():
     result = decode_qwen_local_llm_reply(tokenizer, [1, 2, 3])
 
     assert result == "元気そうで何よりです。最近、楽しかったことはありましたか？"
+
+
+def test_build_qwen_display_fallback_text_keeps_reasoning_when_no_final_answer_exists():
+    raw = "Thinking Process:\n\n1. Analyze the Request.\n2. Continue carefully."
+
+    result = build_qwen_display_fallback_text(raw)
+
+    assert result == "Thinking Process: 1. Analyze the Request. 2. Continue carefully."
+
+
+def test_build_qwen_display_fallback_text_removes_special_tokens_and_answer_prefix():
+    raw = "Assistant: こんにちは。<|im_end|>"
+
+    result = build_qwen_display_fallback_text(raw)
+
+    assert result == "こんにちは。"
 
 
 class DummyBrokenProcessorTokenizer:
