@@ -1,11 +1,11 @@
-"""Qwen3.5-9B をローカルに事前取得するスクリプト。"""
+"""Qwen3.5-27B をローカルに事前取得するスクリプト。"""
 
 import argparse
 import sys
 
 try:
-    from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
     import torch
+    from transformers import AutoProcessor, AutoTokenizer, Qwen3_5ForConditionalGeneration
 except ImportError:
     print("エラー: `transformers` / `torch` が見つかりません。")
     print("Qwen3.5 に対応した依存関係をインストールしてから再実行してください。")
@@ -18,11 +18,11 @@ except Exception:
     BitsAndBytesConfig = None
 
 
-DEFAULT_MODEL_ID = "Qwen/Qwen3.5-9B"
+DEFAULT_MODEL_ID = "Qwen/Qwen3.5-27B"
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Qwen3.5-9B をローカルにダウンロードします。")
+    parser = argparse.ArgumentParser(description="Qwen3.5-27B をローカルにダウンロードします。")
     parser.add_argument(
         "--model-id",
         default=DEFAULT_MODEL_ID,
@@ -36,14 +36,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--enable-4bit",
         action="store_true",
-        help="4bit量子化を明示的に有効化する",
-    )
-    parser.add_argument(
-        "--disable-4bit",
-        action="store_true",
-        help=argparse.SUPPRESS,
+        help="4bit量子化を有効化する（既定は無効）",
     )
     return parser.parse_args()
+
+
+def _load_tokenizer(args: argparse.Namespace):
+    """トークナイザを取得する。"""
+    try:
+        processor = AutoProcessor.from_pretrained(
+            args.model_id,
+            revision=args.revision,
+            trust_remote_code=True,
+        )
+        return getattr(processor, "tokenizer", None) or processor
+    except Exception as processor_error:
+        print(f"警告: AutoProcessor の読み込みに失敗したため AutoTokenizer に切り替えます: {processor_error}")
+        return AutoTokenizer.from_pretrained(
+            args.model_id,
+            revision=args.revision,
+            trust_remote_code=True,
+        )
 
 
 def main() -> None:
@@ -58,14 +71,10 @@ def main() -> None:
     if args.revision:
         print(f"  revision : {args.revision}")
 
-    processor = AutoProcessor.from_pretrained(
-        args.model_id,
-        revision=args.revision,
-        trust_remote_code=True,
-    )
-    use_4bit = args.enable_4bit and not args.disable_4bit
+    tokenizer = _load_tokenizer(args)
     loaded_with_4bit = False
-    if BitsAndBytesConfig is not None and use_4bit:
+
+    if BitsAndBytesConfig is not None and args.enable_4bit:
         try:
             quant_config = BitsAndBytesConfig(
                 load_in_4bit=True,
@@ -84,7 +93,7 @@ def main() -> None:
             print("4bit量子化で取得しました。")
         except Exception as e:
             print(f"警告: 4bit量子化での取得に失敗しました。FP16/BF16へ切り替えます: {e}")
-    elif use_4bit and BitsAndBytesConfig is None:
+    elif args.enable_4bit and BitsAndBytesConfig is None:
         print("警告: BitsAndBytesConfig が利用できないため、4bit量子化を使わずFP16/BF16で取得します。")
 
     if not loaded_with_4bit:
@@ -101,7 +110,6 @@ def main() -> None:
 
     print("モデル取得が完了しました。")
     print("Hugging Face のローカルキャッシュへ保存されています。")
-    tokenizer = getattr(processor, "tokenizer", processor)
     print(f"tokenizer vocab size: {len(tokenizer)}")
 
 

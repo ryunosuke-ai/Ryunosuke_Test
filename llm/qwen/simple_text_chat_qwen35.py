@@ -1,13 +1,11 @@
 """フェーズ遷移なしのテキスト会話ツール（話したい度推定あり）"""
 
+import logging
 import os
 import sys
-import io
-import re
-import logging
 from collections import deque
 from datetime import datetime
-from typing import Optional, List, Deque
+from typing import Deque
 
 try:
     from dotenv import load_dotenv
@@ -27,7 +25,7 @@ except ModuleNotFoundError:
 
 try:
     import torch
-    from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
+    from transformers import AutoProcessor, AutoTokenizer, Qwen3_5ForConditionalGeneration
 except ImportError:
     print("エラー: `transformers` / `torch` が見つかりません。")
     print("Qwen3.5 に対応した依存関係をインストールしてから再実行してください。")
@@ -39,68 +37,70 @@ try:
 except Exception:
     BitsAndBytesConfig = None
 
-# 文字化け対策（Windowsターミナル想定）
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 load_dotenv()
 
-from core.models import ActionType, Observation, MemoryUpdate, ClassificationResult  # noqa: E402
-from core.bayes_engine import (  # noqa: E402
-    update_posterior as _update_posterior,
-    classify_action as _classify_action,
-    DEFAULT_LIKELIHOODS,
+from core.models import ActionType, MemoryUpdate, Observation  # noqa: E402
+from core.bayes_engine import DEFAULT_LIKELIHOODS  # noqa: E402
+from core.local_llm_utils import (  # noqa: E402
+    build_qwen_generation_prompt,
+    decode_qwen_local_llm_reply,
 )
-from core.conv_memory import (  # noqa: E402
-    extract_recent_assistant_questions,
-    update_conv_memory as _update_conv_memory,
-)
-from core.local_llm_utils import clean_qwen_thinking_output, decode_local_llm_reply  # noqa: E402
+from llm.gpt_oss.simple_text_chat_gpt_oss import SimpleTextChatAgent as GptOssSimpleTextChatAgent  # noqa: E402
 
 
-class SimpleTextChatAgent:
+TRUE_VALUES = {"1", "true", "yes", "on"}
+
+
+def _read_env_value(primary_name: str, default: str | None = None, legacy_names: tuple[str, ...] = ()) -> str | None:
+    """環境変数を優先順で取得する。"""
+    for env_name in (primary_name, *legacy_names):
+        value = os.getenv(env_name)
+        if value not in (None, ""):
+            return value
+    return default
+
+
+def _read_env_flag(primary_name: str, default: bool = False, legacy_names: tuple[str, ...] = ()) -> bool:
+    """真偽値の環境変数を解釈する。"""
+    fallback = "1" if default else "0"
+    value = _read_env_value(primary_name, fallback, legacy_names=legacy_names)
+    return str(value).strip().lower() in TRUE_VALUES
+
+
+class SimpleTextChatAgent(GptOssSimpleTextChatAgent):
     """
     フェーズ遷移を使わないテキスト会話エージェント。
-    ベイズ推定による話したい度更新と会話メモ更新は維持し、
-    会話履歴を参照して盛り上がる質問を生成する。
+    返信生成のみ Qwen3.5-27B を使い、その他の会話ロジックは既存実装を流用する。
     """
 
     PHASE_LABEL = "SIMPLE_CHAT_QWEN35"
-    FLOW_WARMUP = "WARMUP"
-    FLOW_BRIDGE = "BRIDGE"
-    FLOW_REMINISCENCE = "REMINISCENCE"
-
-    TRANSITION_COOLDOWN_TURNS = 1
-
-    WARMUP_TO_BRIDGE_ABS = 0.45
-    WARMUP_TO_BRIDGE_FLOOR = 0.28
-    WARMUP_TO_BRIDGE_DELTA = 0.15
-
-    BRIDGE_TO_REMINISCENCE_ABS = 0.60
-    BRIDGE_TO_REMINISCENCE_FLOOR = 0.38
-    BRIDGE_TO_REMINISCENCE_DELTA = 0.18
-
-    BACK_TO_WARMUP_ABS = 0.35
-    DELTA_WINDOW_TURNS = 3
-    DEFAULT_MODEL_ID = "Qwen/Qwen3.5-9B"
-    LOCAL_MAX_NEW_TOKENS = 180
-    LOCAL_TEMPERATURE = 0.7
-    LOCAL_TOP_P = 0.9
+    DEFAULT_MODEL_ID = "Qwen/Qwen3.5-27B"
+    BANNER_TITLE = "単純会話ツール Qwen3.5-27B版（フェーズ遷移なし）"
 
     def __init__(self):
         # --- 1) 設定読み込み ---
         self.openai_key = os.getenv("AZURE_OPENAI_API_KEY")
         self.openai_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
         self.deployment_name = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
-        self.local_model_id = (
-            os.getenv("LOCAL_QWEN35_MODEL_ID")
-            or os.getenv("LOCAL_QWEN_MODEL_ID")
-            or self.DEFAULT_MODEL_ID
+        self.local_model_id = _read_env_value(
+            "LOCAL_QWEN_MODEL_ID",
+            self.DEFAULT_MODEL_ID,
+            legacy_names=("LOCAL_QWEN35_MODEL_ID",),
         )
-        self.show_thinking = os.getenv("LOCAL_QWEN35_SHOW_THINKING", "0") == "1"
+        self.enable_thinking = _read_env_flag(
+            "LOCAL_QWEN_ENABLE_THINKING",
+            default=True,
+            legacy_names=("LOCAL_QWEN35_ENABLE_THINKING",),
+        )
+        self.show_thinking = _read_env_flag(
+            "LOCAL_QWEN_SHOW_THINKING",
+            default=False,
+            legacy_names=("LOCAL_QWEN35_SHOW_THINKING",),
+        )
 
         missing = [k for k, v in [
             ("AZURE_OPENAI_API_KEY", self.openai_key),
@@ -137,10 +137,10 @@ class SimpleTextChatAgent:
         )
         self.logger.info("分類・会話メモ更新は Azure OpenAI を使用します。")
 
-        # --- 4) ローカルQwen3.5 初期化（返信生成で使用） ---
+        # --- 4) ローカルQwen3.5-27B 初期化（返信生成で使用） ---
         if not torch.cuda.is_available():
             print("エラー: CUDA対応GPUが見つかりません。")
-            print("Qwen3.5-9B のローカル実行には GPU 環境が必要です。")
+            print("Qwen3.5-27B のローカル実行には GPU 環境が必要です。")
             print("`nvidia-smi` と `python3 -c 'import torch; print(torch.cuda.is_available())'` を確認してください。")
             sys.exit(1)
         self.local_device = "cuda"
@@ -162,16 +162,44 @@ class SimpleTextChatAgent:
         self.low_engagement_streak: int = 0
         self.p_history: Deque[float] = deque([self.p_want_talk], maxlen=6)
 
+    def _setup_logger(self, ts: str) -> None:
+        self.logger = logging.getLogger("simple_text_chat_qwen35_agent")
+        self.logger.setLevel(logging.INFO)
+
+        fmt = logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s", "%H:%M:%S")
+        file_handler = logging.FileHandler(f"{self.run_dir}/agent_{ts}.log", encoding="utf-8")
+        file_handler.setFormatter(fmt)
+        stream_handler = logging.StreamHandler(sys.stdout)
+        stream_handler.setFormatter(fmt)
+
+        self.logger.handlers.clear()
+        self.logger.addHandler(file_handler)
+        self.logger.addHandler(stream_handler)
+
     def _load_local_qwen(self) -> None:
-        """ローカルQwen3.5モデルを読み込む。"""
+        """ローカルQwen3.5-27Bモデルを読み込む。"""
         try:
-            self.processor = AutoProcessor.from_pretrained(self.local_model_id, trust_remote_code=True)
-            self.tokenizer = getattr(self.processor, "tokenizer", self.processor)
-            enable_4bit = (
-                os.getenv("LOCAL_QWEN35_ENABLE_4BIT")
-                or os.getenv("LOCAL_QWEN_ENABLE_4BIT")
-                or "0"
-            ) == "1"
+            try:
+                self.processor = AutoProcessor.from_pretrained(
+                    self.local_model_id,
+                    trust_remote_code=True,
+                )
+                self.tokenizer = getattr(self.processor, "tokenizer", None) or self.processor
+            except Exception as processor_error:
+                self.logger.warning(
+                    "AutoProcessor の読み込みに失敗したため AutoTokenizer に切り替えます: %s",
+                    processor_error,
+                )
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    self.local_model_id,
+                    trust_remote_code=True,
+                )
+
+            enable_4bit = _read_env_flag(
+                "LOCAL_QWEN_ENABLE_4BIT",
+                default=False,
+                legacy_names=("LOCAL_QWEN35_ENABLE_4BIT",),
+            )
             loaded_with_4bit = False
 
             if BitsAndBytesConfig is not None and enable_4bit:
@@ -189,11 +217,16 @@ class SimpleTextChatAgent:
                         trust_remote_code=True,
                     )
                     loaded_with_4bit = True
-                    self.logger.info("Qwen3.5を4bit量子化で読み込みました。")
+                    self.logger.info("Qwen3.5-27Bを4bit量子化で読み込みました。")
                 except Exception as quant_error:
-                    self.logger.warning("4bit読み込みに失敗したため、FP16/BF16へフォールバックします: %s", quant_error)
+                    self.logger.warning(
+                        "4bit読み込みに失敗したため、FP16/BF16へフォールバックします: %s",
+                        quant_error,
+                    )
             elif enable_4bit and BitsAndBytesConfig is None:
-                self.logger.warning("BitsAndBytesConfig が利用できないため、4bit量子化をスキップしてFP16/BF16を使います。")
+                self.logger.warning(
+                    "BitsAndBytesConfig が利用できないため、4bit量子化をスキップしてFP16/BF16を使います。"
+                )
 
             if not loaded_with_4bit:
                 use_bf16 = torch.cuda.is_bf16_supported()
@@ -205,317 +238,43 @@ class SimpleTextChatAgent:
                     trust_remote_code=True,
                 )
                 self.logger.info(
-                    "Qwen3.5を%sで読み込みました（4bit未使用）。",
+                    "Qwen3.5-27Bを%sで読み込みました（4bit未使用）。",
                     "BF16" if use_bf16 else "FP16",
                 )
             self.local_model.eval()
-            self.logger.info("ローカルQwen3.5モデル読み込み完了: %s", self.local_model_id)
+            self.logger.info("ローカルQwen3.5-27Bモデル読み込み完了: %s", self.local_model_id)
+            self.logger.info("Qwen3.5 thinkingモード: %s", "有効" if self.enable_thinking else "無効")
         except Exception as e:
-            self.logger.error("ローカルQwen3.5モデルの読み込みに失敗: %s", e)
-            print("エラー: ローカルQwen3.5モデルの読み込みに失敗しました。")
-            print("先に `python3 -m llm.qwen.download_qwen35_9b` を実行し、依存関係とGPU環境を確認してください。")
-            print("4bit量子化を試す場合のみ `LOCAL_QWEN35_ENABLE_4BIT=1` を付けて実行してください。")
+            self.logger.error("ローカルQwen3.5-27Bモデルの読み込みに失敗: %s", e)
+            print("エラー: ローカルQwen3.5-27Bモデルの読み込みに失敗しました。")
+            print("先に `python3 -m llm.qwen.download_qwen35_27b` を実行し、依存関係とGPU環境を確認してください。")
+            print("4bitを使う場合は `LOCAL_QWEN_ENABLE_4BIT=1` を付けて実行してください。")
             sys.exit(1)
 
-    # -----------------------------
-    # ログ・表示
-    # -----------------------------
-    def _setup_logger(self, ts: str) -> None:
-        self.logger = logging.getLogger("simple_text_chat_agent")
-        self.logger.setLevel(logging.INFO)
-
-        fmt = logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s", "%H:%M:%S")
-        file_handler = logging.FileHandler(f"{self.run_dir}/agent_{ts}.log", encoding="utf-8")
-        file_handler.setFormatter(fmt)
-        stream_handler = logging.StreamHandler(sys.stdout)
-        stream_handler.setFormatter(fmt)
-
-        self.logger.handlers.clear()
-        self.logger.addHandler(file_handler)
-        self.logger.addHandler(stream_handler)
-
-    def _banner(self, title: str) -> None:
-        line = "=" * 56
-        print(f"\n{line}\n{title}\n{line}")
-
-    def append_to_history(self, role: str, text: str) -> None:
-        try:
-            with open(self.history_file, "a", encoding="utf-8") as f:
-                f.write(f"[{datetime.now().strftime('%H:%M:%S')}] {role}: {text}\n")
-        except Exception:
-            pass
-
-    # -----------------------------
-    # テキスト I/O
-    # -----------------------------
-    def get_input(self) -> Optional[str]:
-        """テキスト入力を取得。空Enterは考え中（None）として扱う。"""
-        try:
-            text = input("\nあなた: ").strip()
-        except EOFError:
-            return None
-        if text:
-            self.append_to_history("User", text)
-            return text
-        print("  （考え中として待機します）")
-        return None
-
-    def output(self, text: str) -> None:
-        """AI応答を表示し、履歴に記録する。"""
-        if not text or not text.strip():
-            return
-        print(f"\nAI: {text}")
-        self.append_to_history("AI", text)
-
-    # -----------------------------
-    # 調査用ステータス表示
-    # -----------------------------
-    def display_status(
-        self,
-        action_type: ActionType,
-        prior: float,
-        posterior: float,
-        label_reason: Optional[str] = None,
-    ) -> None:
-        """ターン・観測・話したい度バーを表示する。"""
-        tag = action_type.value
-
-        # 話したい度バー（20文字幅）
-        bar_len = 20
-        filled = int(posterior * bar_len)
-        bar = "\u2588" * filled + "\u2591" * (bar_len - filled)
-
-        print(f"\n--- 状態 {'─' * 32}")
-        print(f"  フェーズ  : {self.PHASE_LABEL}")
-        print(f"  会話段階  : {self.flow_stage}")
-        print(f"  ターン    : {self.total_turns}/{self.max_total_turns}")
-        print(f"  観測      : {tag}")
-        if label_reason:
-            print(f"  判定理由  : {label_reason}")
-        print(f"  話したい度: {prior:.2f} → {posterior:.2f}  [{bar}]")
-        print(f"{'─' * 42}")
-
-    # -----------------------------
-    # 分析用データのロギング
-    # -----------------------------
-    def log_interaction(
-        self,
-        speaker: str,
-        text: str,
-        primary_label: str = "",
-        label_reason: str = "",
-    ) -> None:
-        ts = datetime.now().strftime("%H:%M:%S")
-        safe_text = str(text).replace('"', '""').replace("\n", " ")
-        safe_reason = str(label_reason).replace('"', '""').replace("\n", " ")
-        try:
-            with open(self.analysis_csv, "a", encoding="utf-8") as f:
-                f.write(
-                    f'{ts},{self.total_turns},{self.PHASE_LABEL},{speaker},'
-                    f'{primary_label},"{safe_reason}",{self.p_want_talk:.2f},"{safe_text}"\n'
-                )
-        except Exception as e:
-            self.logger.warning("CSV書き込み失敗: %s", e)
-
-    # -----------------------------
-    # ベイズ更新（委譲）
-    # -----------------------------
-    def update_posterior(self, action_type: ActionType) -> float:
-        prior = float(self.p_want_talk)
-        self.p_want_talk = _update_posterior(
-            prior,
-            action_type,
-            likelihoods=self.likelihoods,
-        )
-        return self.p_want_talk
-
-    # -----------------------------
-    # 観測分類（委譲）
-    # -----------------------------
-    def classify_action(self, user_text: Optional[str]) -> ClassificationResult:
-        return _classify_action(self.openai_client, self.deployment_name, user_text, self.logger)
-
-    # -----------------------------
-    # 会話メモ更新（委譲）
-    # -----------------------------
-    def update_conv_memory(self, user_text: Optional[str]) -> None:
-        if not user_text:
-            return
-        history = self.load_history_as_messages(max_messages=12)
-        msgs = self.load_history_as_messages(max_messages=12)
-        recent_questions = extract_recent_assistant_questions(msgs)
-        self.conv_memory = _update_conv_memory(
-            self.openai_client,
-            self.deployment_name,
-            self.conv_memory,
-            user_text,
-            history,
-            recent_questions,
-            self.logger,
+    def _build_qwen_prompt_text(self, messages: list[dict]) -> str:
+        """Qwen 用のチャットプロンプトを組み立てる。"""
+        return build_qwen_generation_prompt(
+            self.tokenizer,
+            messages,
+            enable_thinking=self.enable_thinking,
         )
 
-    def _build_interaction_mode_instruction(self, obs: Observation, ending_mode: bool) -> str:
-        """話したい度と観測ラベルに応じた会話モード指示を返す。"""
-        if ending_mode:
-            return (
-                "【モード】終了。\n"
-                "・最後の発話を受け止め、感謝して締める\n"
-                "・質問禁止。新しい話題を出さない\n"
-            )
+    def _build_model_inputs(self, prompt_text: str) -> dict:
+        """プロンプトをモデル入力へ変換して GPU へ載せる。"""
+        model_inputs = self.tokenizer(prompt_text, return_tensors="pt")
+        return {
+            key: value.to(self.local_device) if hasattr(value, "to") else value
+            for key, value in model_inputs.items()
+        }
 
-        if obs.action_type == ActionType.DISENGAGE or self.p_want_talk < 0.30:
-            return (
-                "【モード】負荷を下げる。\n"
-                "・受け止め中心で短く返す\n"
-                "・質問は原則しない。する場合も確認1つだけ\n"
-                "・今は回想を深めず、現在や最近の話題に戻す\n"
-            )
-
-        if obs.action_type == ActionType.MINIMAL or self.p_want_talk < 0.45:
-            return (
-                "【モード】軽い再点火。\n"
-                "・短い共感の後、質問するならはい/いいえか二択で1つまで\n"
-                "・答えやすさを優先し、負担の大きい想起は避ける\n"
-            )
-
-        if obs.action_type == ActionType.RESPONSIVE or self.p_want_talk < 0.70:
-            return (
-                "【モード】自然な拡張。\n"
-                "・共感の後、具体化しやすい質問を1つまで\n"
-            )
-
-        return (
-            "【モード】盛り上げ。\n"
-            "・ユーザーの話を広げる自由回答型の質問を1つまで\n"
-            "・質問がなくても自然なら無理に聞かない\n"
+    def _decode_qwen_reply(self, generated_ids) -> str:
+        """生成結果からユーザー表示用の返答本文を抽出する。"""
+        return decode_qwen_local_llm_reply(
+            self.tokenizer,
+            generated_ids,
+            show_thinking=self.show_thinking,
         )
 
-    def _build_stage_instruction(self) -> str:
-        if self.flow_stage == self.FLOW_WARMUP:
-            return (
-                "【会話段階】WARMUP（最近の出来事・身の回り）。\n"
-                "・今日/今週/最近の出来事など、いまに近い話題を優先\n"
-                "・まだ回想は無理に求めない\n"
-                "・質問は生活の事実確認に寄せ、感情の深掘りは控える\n"
-            )
-        if self.flow_stage == self.FLOW_BRIDGE:
-            return (
-                "【会話段階】BRIDGE（最近の話題から過去への橋渡し）。\n"
-                "・最近の出来事と似た過去体験があるかを、やわらかく確認\n"
-                "・橋渡し質問は1つまで。答えづらければ現在の話題へ戻す\n"
-                "・接続語を使って自然に移る（例: そういえば、ちなみに、似た場面で）\n"
-            )
-        return (
-            "【会話段階】REMINISCENCE（回想法モード）。\n"
-            "・いまは回想法（Reminiscence）に基づいて会話する\n"
-            "・目的は記憶の正確さ確認ではなく、体験の想起と語りの促進\n"
-            "・質問は次の4タイプのうち1つだけ選ぶ: 情景 / 人物 / 気持ち / 意味\n"
-            "・話したい度が低い時は情景か人物のみ。高い時のみ気持ちや意味へ進む\n"
-            "・重くなりすぎたら現在や最近の話題へ戻す\n"
-        )
-
-    def _build_stage_goal_instruction(self) -> str:
-        if self.flow_stage == self.FLOW_WARMUP:
-            return "【段階目標】話しやすい空気を作り、最近の出来事を具体化する。"
-        if self.flow_stage == self.FLOW_BRIDGE:
-            return "【段階目標】最近の話題と過去体験の接点を1つ見つける。"
-        return "【段階目標】回想法として、思い出の情景・人物・気持ち・意味のいずれかを自然に語ってもらう。"
-
-    def _build_reminiscence_examples(self) -> str:
-        return (
-            "【良い質問例】\n"
-            "・最近よく歩く道は、昔にも似た場所がありましたか？\n"
-            "・その頃の景色で、今でも浮かびやすい場面はありますか？\n"
-            "・その思い出を振り返ると、どんな気持ちが残っていますか？\n"
-            "【悪い質問例】\n"
-            "・それは何年何月何日ですか？正確に教えてください。\n"
-            "・前にも聞きましたが、もう一度同じ内容を詳しく答えてください。\n"
-        )
-
-    def _detect_reminiscence_cue(self, text: Optional[str]) -> bool:
-        if not text:
-            return False
-        return bool(re.search(r"(昔|当時|以前|子どもの頃|学生時代|若い頃|初めて|思い出)", text))
-
-    def _delta_window(self) -> float:
-        if not self.p_history:
-            return 0.0
-        recent = list(self.p_history)[-self.DELTA_WINDOW_TURNS:]
-        current = recent[-1]
-        return current - min(recent)
-
-    def _transition_guard(self) -> bool:
-        # 遷移直後の揺れを避けるため、1ターンのクールダウンを置く
-        return (self.total_turns - self.last_transition_turn) > self.TRANSITION_COOLDOWN_TURNS
-
-    def _recovery_condition(self, floor: float, delta_threshold: float, action_type: ActionType) -> bool:
-        if action_type not in (ActionType.RESPONSIVE, ActionType.ACTIVE):
-            return False
-        if self.low_engagement_streak > 0:
-            return False
-        return (self.p_want_talk >= floor) and (self._delta_window() >= delta_threshold)
-
-    def _set_flow_stage(self, new_stage: str, reason: str) -> None:
-        if self.flow_stage == new_stage:
-            self.stage_turns += 1
-            return
-        prev = self.flow_stage
-        self.flow_stage = new_stage
-        self.stage_turns = 1
-        self.last_transition_turn = self.total_turns
-        self.logger.info(
-            "会話段階遷移: %s -> %s（%s, p=%.2f, delta=%.2f）",
-            prev,
-            new_stage,
-            reason,
-            self.p_want_talk,
-            self._delta_window(),
-        )
-
-    def _update_flow_stage(self, obs: Observation) -> None:
-        if not self._transition_guard():
-            self.stage_turns += 1
-            return
-
-        if obs.action_type in (ActionType.MINIMAL, ActionType.DISENGAGE) or self.p_want_talk < self.BACK_TO_WARMUP_ABS:
-            self._set_flow_stage(self.FLOW_WARMUP, "反応低下または話したい度低下")
-            return
-
-        if self.flow_stage == self.FLOW_WARMUP:
-            abs_ready = self.p_want_talk >= self.WARMUP_TO_BRIDGE_ABS
-            rec_ready = self._recovery_condition(
-                self.WARMUP_TO_BRIDGE_FLOOR,
-                self.WARMUP_TO_BRIDGE_DELTA,
-                obs.action_type,
-            )
-            if self.stage_turns >= 1 and (abs_ready or rec_ready):
-                reason = "絶対閾値到達" if abs_ready else "回復量条件到達"
-                self._set_flow_stage(self.FLOW_BRIDGE, reason)
-                return
-            self.stage_turns += 1
-            return
-
-        if self.flow_stage == self.FLOW_BRIDGE:
-            abs_ready = self.p_want_talk >= self.BRIDGE_TO_REMINISCENCE_ABS
-            rec_ready = self._recovery_condition(
-                self.BRIDGE_TO_REMINISCENCE_FLOOR,
-                self.BRIDGE_TO_REMINISCENCE_DELTA,
-                obs.action_type,
-            )
-            cue_ready = self._detect_reminiscence_cue(obs.user_text) or obs.action_type == ActionType.ACTIVE
-            if cue_ready and (abs_ready or rec_ready):
-                reason = "絶対閾値+橋渡し手がかり" if abs_ready else "回復量+橋渡し手がかり"
-                self._set_flow_stage(self.FLOW_REMINISCENCE, reason)
-                return
-            self.stage_turns += 1
-            return
-
-        # REMINISCENCE維持
-        self.stage_turns += 1
-
-    # -----------------------------
-    # 返信生成（LLM）
-    # -----------------------------
     def think_and_reply(self, obs: Observation, waiting_mode: bool = False, ending_mode: bool = False) -> str:
         history = self.load_history_as_messages(max_messages=10)
 
@@ -578,18 +337,8 @@ class SimpleTextChatAgent:
         messages.append({"role": "user", "content": user_content})
 
         try:
-            # Qwen3.5-9B では text-only の通常メッセージに対して
-            # processor.apply_chat_template(..., tokenize=True) が
-            # TypeError("string indices must be integers") で落ちるため、
-            # テンプレート展開とトークナイズを分離して回避する。
-            prompt_text = self.tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
-                enable_thinking=True,
-            )
-            model_inputs = self.tokenizer(prompt_text, return_tensors="pt")
-            model_inputs = {k: v.to(self.local_device) for k, v in model_inputs.items()}
+            prompt_text = self._build_qwen_prompt_text(messages)
+            model_inputs = self._build_model_inputs(prompt_text)
             input_ids = model_inputs["input_ids"]
 
             if "attention_mask" not in model_inputs:
@@ -607,45 +356,22 @@ class SimpleTextChatAgent:
                 )
 
             generated = output_ids[0][input_ids.shape[1]:]
-            reply = decode_local_llm_reply(self.tokenizer, generated)
-            reply = clean_qwen_thinking_output(reply, show_thinking=self.show_thinking)
+            reply = self._decode_qwen_reply(generated)
             if not reply:
+                raw_text = self.tokenizer.decode(generated, skip_special_tokens=False).strip()
+                self.logger.warning("Qwen3.5-27B生出力: %r", raw_text)
                 return "少し考えがまとまりませんでした。よければ、もう一度だけ聞かせてください。"
             return reply
         except Exception as e:
-            self.logger.warning("ローカルQwen3.5生成失敗: %s", e)
+            self.logger.warning("ローカルQwen3.5-27B生成失敗: %s", e)
             return "ごめんなさい、少し調子が悪いみたいです。落ち着いたらまた話しかけてくださいね。"
 
-    def load_history_as_messages(self, max_messages: int = 10) -> List[dict]:
-        if not os.path.exists(self.history_file):
-            return []
-        try:
-            with open(self.history_file, "r", encoding="utf-8") as f:
-                raw = f.read()
-            parts = re.split(r"(\[\d{2}:\d{2}:\d{2}\] (?:User|AI):)", raw)
-            messages = []
-            role = None
-            for p in parts:
-                if not p.strip():
-                    continue
-                if "User:" in p:
-                    role = "user"
-                elif "AI:" in p:
-                    role = "assistant"
-                else:
-                    if role:
-                        messages.append({"role": role, "content": p.strip()})
-            return messages[-max_messages:]
-        except Exception:
-            return []
-
-    # -----------------------------
-    # メインループ
-    # -----------------------------
     def run(self) -> None:
-        self._banner("単純会話ツール Qwen3.5版（フェーズ遷移なし）")
+        self._banner(self.BANNER_TITLE)
         print("  空Enter = 考え中として待機 / Ctrl+C = 終了")
         print(f"  最大ターン数: {self.max_total_turns}")
+        print(f"  ローカルモデル: {self.local_model_id}")
+        print(f"  thinkingモード: {'ON' if self.enable_thinking else 'OFF'}")
         print(f"  ログ出力先: {self.run_dir}/")
         print()
 
