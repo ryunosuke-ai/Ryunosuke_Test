@@ -1,0 +1,14 @@
+.git
+.gitignore
+.codex
+.env
+.env.*
+.pytest_cache
+.venv
+__pycache__
+test_env
+logs
+models
+artifacts
+hf_cache
+*.pyc

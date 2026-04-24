@@ -25,6 +25,8 @@ python3 -m apps.bayes_v3
 
 `apps/ui_display.py` は起動時に `ui_ready.flag` を作成し、`apps/bayes_v3.py` はそのフラグを確認してから開始します。音声 I/O を使わずに会話ロジックだけ確認したい場合は、`python3 -m apps.text_chat` を使います。
 
+Docker を使う場合は `docs/DOCKER_SETUP.md` を参照してください。初期構成では `apps/text_chat.py` と `apps/ui_display.py` を対象とし、音声版 `apps/bayes_v3.py` はホスト実行前提です。
+
 ## 使い方
 通常運用では、マイク入力と音声出力を使って会話します。会話中はユーザー発話の種類と `p_want_talk` に応じて、質問の強さや話題の深さが変わります。テキスト版では、コンソール上で会話しながらフェーズ、ターン数、観測タイプ、`p_want_talk` の推移を確認できます。
 

@@ -1,0 +1,48 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    working_dir: /workspace
+    env_file:
+      - .env
+    environment:
+      HF_HOME: /workspace/.cache/huggingface
+      TRANSFORMERS_CACHE: /workspace/.cache/huggingface
+      BASE_MODEL_DIR: /workspace/models/base
+      TRAINING_ARTIFACT_DIR: /workspace/artifacts
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    volumes:
+      - ./:/workspace
+      - ./hf_cache:/workspace/.cache/huggingface
+      - ./models/base:/workspace/models/base
+      - ./artifacts:/workspace/artifacts
+    stdin_open: true
+    tty: true
+    command: sleep infinity
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  ui:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    working_dir: /workspace
+    env_file:
+      - .env
+    environment:
+      HF_HOME: /workspace/.cache/huggingface
+      TRANSFORMERS_CACHE: /workspace/.cache/huggingface
+    volumes:
+      - ./:/workspace
+      - ./hf_cache:/workspace/.cache/huggingface
+      - ./artifacts:/workspace/artifacts
+    ports:
+      - "8501:8501"
+    command: python3 -m streamlit run apps/ui_display.py --server.address=0.0.0.0
