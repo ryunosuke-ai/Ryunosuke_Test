@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from tools.openface_stream_to_csv import (
+    DEFAULT_INPUT_DIR,
     EXPECTED_DIMENSION,
     SMILE_RELATED_COLUMNS,
     build_openface_column_names,
@@ -52,7 +53,7 @@ def test_convert_stream_to_csv_writes_expected_shape(tmp_path: Path):
     write_meta_file(meta_path, frame_count=2)
     write_data_file(data_path, frame_count=2)
 
-    frame_count, dimension = convert_stream_to_csv(meta_path, data_path, output_path)
+    frame_count, dimension = convert_stream_to_csv(meta_path, data_path, output_path, au_only=False)
 
     assert frame_count == 2
     assert dimension == EXPECTED_DIMENSION
@@ -100,14 +101,14 @@ def test_convert_stream_to_csv_fails_when_data_file_is_missing(tmp_path: Path):
         convert_stream_to_csv(meta_path, tmp_path / "missing.stream~", output_path)
 
 
-def test_convert_stream_to_csv_can_extract_smile_related_columns_only(tmp_path: Path):
+def test_convert_stream_to_csv_extracts_smile_related_columns_by_default(tmp_path: Path):
     meta_path = tmp_path / "sample.openface2.stream"
     data_path = tmp_path / "sample.openface2.stream~"
     output_path = tmp_path / "smile_only.csv"
     write_meta_file(meta_path, frame_count=1)
     write_data_file(data_path, frame_count=1)
 
-    convert_stream_to_csv(meta_path, data_path, output_path, smile_au_only=True)
+    convert_stream_to_csv(meta_path, data_path, output_path)
 
     with output_path.open("r", newline="", encoding="utf-8") as file:
         rows = list(csv.reader(file))
@@ -155,7 +156,7 @@ def test_convert_subject_directory_writes_per_subject_csv(tmp_path: Path):
         write_meta_file(subject_dir / "novice.openface2.stream", frame_count=1)
         write_data_file(subject_dir / "novice.openface2.stream~", frame_count=1)
 
-    results, failures = convert_subject_directory(input_dir, output_dir, smile_au_only=True)
+    results, failures = convert_subject_directory(input_dir, output_dir)
 
     assert len(results) == 2
     assert failures == []
@@ -181,10 +182,54 @@ def test_convert_subject_directory_skips_invalid_subject_files(tmp_path: Path):
     write_meta_file(invalid_dir / "novice.openface2.stream", frame_count=2)
     write_data_file(invalid_dir / "novice.openface2.stream~", frame_count=1)
 
-    results, failures = convert_subject_directory(input_dir, output_dir, smile_au_only=True)
+    results, failures = convert_subject_directory(input_dir, output_dir)
 
     assert len(results) == 1
     assert results[0][0] == valid_dir / "novice.openface2.stream"
     assert len(failures) == 1
     assert failures[0][0] == invalid_dir / "novice.openface2.stream"
     assert "サイズがメタ情報と一致しません" in failures[0][1]
+
+
+def test_parse_args_defaults_to_datasets_and_smile_columns(monkeypatch):
+    from tools.openface_stream_to_csv import parse_args
+
+    monkeypatch.setattr("sys.argv", ["openface_stream_to_csv.py"])
+
+    args = parse_args()
+
+    assert args.input_dir == DEFAULT_INPUT_DIR
+    assert args.meta is None
+    assert args.all_columns is False
+
+
+def test_parse_args_all_columns_keeps_explicit_full_output(monkeypatch):
+    from tools.openface_stream_to_csv import parse_args
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["openface_stream_to_csv.py", "--input-dir", "datasets", "--all-columns"],
+    )
+
+    args = parse_args()
+
+    assert args.input_dir == "datasets"
+    assert args.all_columns is True
+
+
+def test_convert_subject_directory_can_write_all_columns(tmp_path: Path):
+    input_dir = tmp_path / "datasets"
+    output_dir = tmp_path / "openface_csv"
+    subject_dir = input_dir / "086"
+    subject_dir.mkdir(parents=True)
+    write_meta_file(subject_dir / "novice.openface2.stream", frame_count=1)
+    write_data_file(subject_dir / "novice.openface2.stream~", frame_count=1)
+
+    results, failures = convert_subject_directory(input_dir, output_dir, au_only=False)
+
+    assert len(results) == 1
+    assert failures == []
+    output_path = output_dir / "086" / "novice.openface2.csv"
+    with output_path.open("r", newline="", encoding="utf-8") as file:
+        rows = list(csv.reader(file))
+    assert len(rows[0]) == EXPECTED_DIMENSION
