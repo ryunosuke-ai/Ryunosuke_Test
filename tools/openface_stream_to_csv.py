@@ -9,6 +9,7 @@ import sys
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable
 
 
 EXPECTED_DIMENSION = 714
@@ -34,10 +35,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="OpenFace の `.stream` / `.stream~` を列名付き CSV に変換します。"
     )
-    parser.add_argument(
+    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument(
         "--meta",
-        required=True,
         help="SSI メタ情報ファイル (`.stream`) のパス。",
+    )
+    input_group.add_argument(
+        "--input-dir",
+        help="被験者ごとのフォルダを含むディレクトリ。各被験者の `novice.openface2.stream` を走査して変換します。",
     )
     parser.add_argument(
         "--data",
@@ -45,8 +50,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output",
-        required=True,
-        help="出力する CSV ファイルのパス。",
+        help="出力する CSV ファイルのパス。単発変換時のみ使用し、省略時は入力ファイル横に自動生成します。",
+    )
+    parser.add_argument(
+        "--output-dir",
+        help="一括変換時の出力先ルート。省略時は `--input-dir/openface_csv` を使います。",
     )
     parser.add_argument(
         "--smile-au-only",
@@ -180,12 +188,50 @@ def resolve_data_path(meta_path: Path, explicit_data_path: str | None) -> Path:
     return Path(f"{meta_path}~")
 
 
+def resolve_output_path(meta_path: Path, explicit_output_path: str | None, smile_au_only: bool) -> Path:
+    """単発変換時の出力パスを確定する。"""
+    if explicit_output_path:
+        return Path(explicit_output_path)
+
+    suffix = ".smile_au.csv" if smile_au_only else ".csv"
+    return meta_path.with_suffix(suffix)
+
+
 def build_selected_column_indices(all_columns: list[str], smile_au_only: bool) -> list[int]:
     """出力対象列のインデックス一覧を返す。"""
     if not smile_au_only:
         return list(range(len(all_columns)))
 
     return [all_columns.index(column_name) for column_name in SMILE_RELATED_COLUMNS]
+
+
+def find_subject_meta_files(input_dir: Path) -> list[Path]:
+    """被験者ディレクトリ配下の `novice.openface2.stream` を列挙する。"""
+    if not input_dir.exists():
+        raise FileNotFoundError(f"入力ディレクトリが見つかりません: {input_dir}")
+    if not input_dir.is_dir():
+        raise ValueError(f"入力パスがディレクトリではありません: {input_dir}")
+
+    return sorted(path for path in input_dir.glob("*/novice.openface2.stream") if path.is_file())
+
+
+def resolve_batch_output_root(input_dir: Path, explicit_output_dir: str | None) -> Path:
+    """一括変換時の出力ルートを確定する。"""
+    if explicit_output_dir:
+        return Path(explicit_output_dir)
+    return input_dir / "openface_csv"
+
+
+def build_batch_output_path(
+    meta_path: Path,
+    input_dir: Path,
+    output_root: Path,
+    smile_au_only: bool,
+) -> Path:
+    """被験者ごとの出力 CSV パスを生成する。"""
+    subject_dir = meta_path.parent.relative_to(input_dir)
+    filename = "novice.openface2.smile_au.csv" if smile_au_only else "novice.openface2.csv"
+    return output_root / subject_dir / filename
 
 
 def validate_metadata(metadata: StreamMetadata) -> None:
@@ -254,14 +300,75 @@ def convert_stream_to_csv(
     return metadata.frame_count, metadata.dimension
 
 
+def convert_subject_directory(
+    input_dir: Path,
+    output_root: Path,
+    *,
+    smile_au_only: bool = False,
+) -> tuple[list[tuple[Path, Path, int, int]], list[tuple[Path, str]]]:
+    """被験者ごとの `novice.openface2.stream` を一括で CSV に変換する。"""
+    meta_paths = find_subject_meta_files(input_dir)
+    if not meta_paths:
+        raise ValueError(
+            f"`{input_dir}` 配下に `novice.openface2.stream` が見つかりませんでした。"
+        )
+
+    results: list[tuple[Path, Path, int, int]] = []
+    failures: list[tuple[Path, str]] = []
+    for meta_path in meta_paths:
+        data_path = resolve_data_path(meta_path, None)
+        output_path = build_batch_output_path(meta_path, input_dir, output_root, smile_au_only)
+        try:
+            frame_count, dimension = convert_stream_to_csv(
+                meta_path,
+                data_path,
+                output_path,
+                smile_au_only=smile_au_only,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            failures.append((meta_path, str(exc)))
+            continue
+        results.append((meta_path, output_path, frame_count, dimension))
+    return results, failures
+
+
+def print_batch_summary(
+    results: Iterable[tuple[Path, Path, int, int]],
+    failures: Iterable[tuple[Path, str]],
+    smile_au_only: bool,
+) -> None:
+    """一括変換結果を簡潔に表示する。"""
+    results = list(results)
+    failures = list(failures)
+    print(f"変換件数: {len(results)}")
+    print(f"スキップ件数: {len(failures)}")
+    if smile_au_only:
+        print(f"抽出列: {', '.join(SMILE_RELATED_COLUMNS)}")
+    for meta_path, output_path, frame_count, _dimension in results:
+        print(f"{meta_path} -> {output_path} ({frame_count} フレーム)")
+    for meta_path, reason in failures:
+        print(f"スキップ: {meta_path} ({reason})")
+
+
 def main() -> int:
     """CLI のエントリーポイント。"""
     args = parse_args()
-    meta_path = Path(args.meta)
-    data_path = resolve_data_path(meta_path, args.data)
-    output_path = Path(args.output)
 
     try:
+        if args.input_dir:
+            input_dir = Path(args.input_dir)
+            output_root = resolve_batch_output_root(input_dir, args.output_dir)
+            results, failures = convert_subject_directory(
+                input_dir,
+                output_root,
+                smile_au_only=args.smile_au_only,
+            )
+            print_batch_summary(results, failures, args.smile_au_only)
+            return 0
+
+        meta_path = Path(args.meta)
+        data_path = resolve_data_path(meta_path, args.data)
+        output_path = resolve_output_path(meta_path, args.output, args.smile_au_only)
         frame_count, dimension = convert_stream_to_csv(
             meta_path,
             data_path,
