@@ -1,4 +1,4 @@
-"""OpenPose の SSI ストリームを CSV に変換する CLI。"""
+"""OpenFace / OpenPose の SSI ストリームを CSV に変換する CLI。"""
 
 from __future__ import annotations
 
@@ -16,7 +16,11 @@ DEFAULT_INPUT_DIR = "datasets"
 DEFAULT_OUTPUT_DIR_NAME = "multimodal_csv"
 FLOAT32_BYTE_SIZE = 4
 
+MODALITY_OPENFACE = "openface"
 MODALITY_OPENPOSE = "openpose"
+ALL_MODALITIES = (MODALITY_OPENFACE, MODALITY_OPENPOSE)
+
+SMILE_RELATED_COLUMNS = ["frame", "timestamp", "AU06_r", "AU06_c", "AU12_r", "AU12_c"]
 
 
 @dataclass(frozen=True)
@@ -42,6 +46,8 @@ class ModalitySpec:
     expected_dimension: int
     output_filename: str
     columns: list[str]
+    selected_columns: list[str] | None = None
+    prepend_frame_timestamp: bool = False
 
 
 @dataclass(frozen=True)
@@ -58,7 +64,7 @@ class ConversionResult:
 def parse_args() -> argparse.Namespace:
     """コマンドライン引数を解析する。"""
     parser = argparse.ArgumentParser(
-        description="OpenPose の `.stream` / `.stream~` を CSV に変換します。"
+        description="OpenFace / OpenPose の `.stream` / `.stream~` を CSV に変換します。"
     )
     parser.add_argument(
         "--input-dir",
@@ -69,7 +75,97 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         help=f"出力先ルート。省略時は `--input-dir/{DEFAULT_OUTPUT_DIR_NAME}` を使います。",
     )
+    parser.add_argument(
+        "--modalities",
+        nargs="+",
+        choices=ALL_MODALITIES,
+        default=list(ALL_MODALITIES),
+        help="変換するモダリティ。複数指定できます（既定: openface openpose）。",
+    )
+    parser.add_argument(
+        "--openface-all-columns",
+        action="store_true",
+        help="OpenFace を AU06/AU12 のみではなく 714 次元すべてで出力します。",
+    )
     return parser.parse_args()
+
+
+def build_openface_column_names() -> list[str]:
+    """714 次元の OpenFace 列名一覧を生成する。"""
+    columns = [
+        "frame",
+        "face_id",
+        "timestamp",
+        "confidence",
+        "success",
+        "gaze_0_x",
+        "gaze_0_y",
+        "gaze_0_z",
+        "gaze_1_x",
+        "gaze_1_y",
+        "gaze_1_z",
+        "gaze_angle_x",
+        "gaze_angle_y",
+    ]
+
+    for prefix in ("eye_lmk_x", "eye_lmk_y", "eye_lmk_X", "eye_lmk_Y", "eye_lmk_Z"):
+        columns.extend(f"{prefix}_{index}" for index in range(56))
+
+    columns.extend(["pose_Tx", "pose_Ty", "pose_Tz", "pose_Rx", "pose_Ry", "pose_Rz"])
+
+    for prefix in ("x", "y", "X", "Y", "Z"):
+        columns.extend(f"{prefix}_{index}" for index in range(68))
+
+    columns.extend(["p_scale", "p_rx", "p_ry", "p_rz", "p_tx", "p_ty"])
+    columns.extend(f"p_{index}" for index in range(34))
+
+    columns.extend(
+        [
+            "AU01_r",
+            "AU02_r",
+            "AU04_r",
+            "AU05_r",
+            "AU06_r",
+            "AU07_r",
+            "AU09_r",
+            "AU10_r",
+            "AU12_r",
+            "AU14_r",
+            "AU15_r",
+            "AU17_r",
+            "AU20_r",
+            "AU23_r",
+            "AU25_r",
+            "AU26_r",
+            "AU45_r",
+        ]
+    )
+    columns.extend(
+        [
+            "AU01_c",
+            "AU02_c",
+            "AU04_c",
+            "AU05_c",
+            "AU06_c",
+            "AU07_c",
+            "AU09_c",
+            "AU10_c",
+            "AU12_c",
+            "AU14_c",
+            "AU15_c",
+            "AU17_c",
+            "AU20_c",
+            "AU23_c",
+            "AU25_c",
+            "AU26_c",
+            "AU28_c",
+            "AU45_c",
+        ]
+    )
+
+    if len(columns) != 714:
+        raise AssertionError(f"OpenFace の列数が 714 になっていません: {len(columns)}")
+    return columns
 
 
 def build_openpose_column_names() -> list[str]:
@@ -103,15 +199,28 @@ def build_openpose_column_names() -> list[str]:
     return columns
 
 
-def build_modality_specs() -> dict[str, ModalitySpec]:
+def build_modality_specs(*, openface_all_columns: bool = False) -> dict[str, ModalitySpec]:
     """対応モダリティの仕様を返す。"""
+    openface_columns = build_openface_column_names()
+    openface_selected_columns = None if openface_all_columns else SMILE_RELATED_COLUMNS
+    openface_output = "novice.openface2.csv" if openface_all_columns else "novice.openface2.smile_au.csv"
+
     return {
+        MODALITY_OPENFACE: ModalitySpec(
+            name=MODALITY_OPENFACE,
+            stream_name="novice.openface2.stream",
+            expected_dimension=714,
+            output_filename=openface_output,
+            columns=openface_columns,
+            selected_columns=openface_selected_columns,
+        ),
         MODALITY_OPENPOSE: ModalitySpec(
             name=MODALITY_OPENPOSE,
             stream_name="novice.openpose.stream",
             expected_dimension=139,
             output_filename="novice.openpose.csv",
             columns=build_openpose_column_names(),
+            prepend_frame_timestamp=True,
         ),
     }
 
@@ -175,6 +284,14 @@ def validate_metadata(metadata: StreamMetadata, spec: ModalitySpec) -> None:
     if metadata.value_type.upper() != "FLOAT":
         raise ValueError(f"未対応の型です: {metadata.value_type}。`type=\"FLOAT\"` を想定しています。")
 
+
+def build_output_columns_and_indices(spec: ModalitySpec) -> tuple[list[str], list[int]]:
+    """出力対象列と元データ上のインデックスを返す。"""
+    if spec.selected_columns is None:
+        return spec.columns, list(range(len(spec.columns)))
+    return spec.selected_columns, [spec.columns.index(column) for column in spec.selected_columns]
+
+
 def read_and_write_csv(meta_path: Path, data_path: Path, output_path: Path, spec: ModalitySpec) -> tuple[int, int]:
     """1 つの SSI ストリームを CSV に変換する。"""
     metadata = load_stream_metadata(meta_path)
@@ -198,17 +315,24 @@ def read_and_write_csv(meta_path: Path, data_path: Path, output_path: Path, spec
     output_path.parent.mkdir(parents=True, exist_ok=True)
     row_format = "<" + ("f" * metadata.dimension)
     row_size = struct.calcsize(row_format)
+    selected_columns, selected_indices = build_output_columns_and_indices(spec)
+    header = ["frame", "timestamp", *selected_columns] if spec.prepend_frame_timestamp else selected_columns
 
     with data_path.open("rb") as data_file, output_path.open("w", newline="", encoding="utf-8") as csv_file:
         writer = csv.writer(csv_file)
-        writer.writerow(["frame", "timestamp", *spec.columns])
+        writer.writerow(header)
 
         for frame_index in range(metadata.frame_count):
             row_bytes = data_file.read(row_size)
             if len(row_bytes) != row_size:
                 raise ValueError(f"{frame_index} 行目の読み取り中にデータ長が不足しました。")
-            timestamp = metadata.start_time + (frame_index / metadata.sample_rate)
-            writer.writerow([frame_index + 1, timestamp, *struct.unpack(row_format, row_bytes)])
+            row_values = struct.unpack(row_format, row_bytes)
+            selected_values = [row_values[index] for index in selected_indices]
+            if spec.prepend_frame_timestamp:
+                timestamp = metadata.start_time + (frame_index / metadata.sample_rate)
+                writer.writerow([frame_index + 1, timestamp, *selected_values])
+            else:
+                writer.writerow(selected_values)
 
         extra_bytes = data_file.read(1)
         if extra_bytes:
@@ -229,15 +353,21 @@ def find_subject_dirs(input_dir: Path) -> list[Path]:
 def convert_subject_directory(
     input_dir: Path,
     output_root: Path,
+    modality_names: Iterable[str],
+    *,
+    openface_all_columns: bool = False,
 ) -> tuple[list[ConversionResult], list[tuple[str, Path, str]]]:
-    """被験者ごとに OpenPose を CSV に変換する。"""
-    specs = build_modality_specs()
-    spec = specs[MODALITY_OPENPOSE]
+    """被験者ごとに OpenFace / OpenPose を CSV に変換する。"""
+    specs = build_modality_specs(openface_all_columns=openface_all_columns)
+    modality_names = list(modality_names)
+    unknown_modalities = [name for name in modality_names if name not in specs]
+    if unknown_modalities:
+        raise ValueError(f"未対応のモダリティです: {', '.join(unknown_modalities)}")
 
     subject_dirs = [
         subject_dir
         for subject_dir in find_subject_dirs(input_dir)
-        if (subject_dir / spec.stream_name).exists()
+        if any((subject_dir / specs[modality_name].stream_name).exists() for modality_name in modality_names)
     ]
     if not subject_dirs:
         raise ValueError(f"`{input_dir}` 配下に対象 stream を含む被験者ディレクトリが見つかりませんでした。")
@@ -245,25 +375,27 @@ def convert_subject_directory(
     results: list[ConversionResult] = []
     failures: list[tuple[str, Path, str]] = []
     for subject_dir in subject_dirs:
-        meta_path = subject_dir / spec.stream_name
-        data_path = resolve_data_path(meta_path)
-        output_path = output_root / subject_dir.name / spec.output_filename
+        for modality_name in modality_names:
+            spec = specs[modality_name]
+            meta_path = subject_dir / spec.stream_name
+            data_path = resolve_data_path(meta_path)
+            output_path = output_root / subject_dir.name / spec.output_filename
 
-        try:
-            frame_count, dimension = read_and_write_csv(meta_path, data_path, output_path, spec)
-        except (FileNotFoundError, ValueError) as exc:
-            failures.append((MODALITY_OPENPOSE, meta_path, str(exc)))
-            continue
+            try:
+                frame_count, dimension = read_and_write_csv(meta_path, data_path, output_path, spec)
+            except (FileNotFoundError, ValueError) as exc:
+                failures.append((modality_name, meta_path, str(exc)))
+                continue
 
-        results.append(
-            ConversionResult(
-                modality=MODALITY_OPENPOSE,
-                meta_path=meta_path,
-                output_path=output_path,
-                frame_count=frame_count,
-                dimension=dimension,
+            results.append(
+                ConversionResult(
+                    modality=modality_name,
+                    meta_path=meta_path,
+                    output_path=output_path,
+                    frame_count=frame_count,
+                    dimension=dimension,
+                )
             )
-        )
 
     return results, failures
 
@@ -290,7 +422,12 @@ def main() -> int:
     output_root = resolve_output_root(input_dir, args.output_dir)
 
     try:
-        results, failures = convert_subject_directory(input_dir, output_root)
+        results, failures = convert_subject_directory(
+            input_dir,
+            output_root,
+            args.modalities,
+            openface_all_columns=args.openface_all_columns,
+        )
     except (FileNotFoundError, ValueError) as exc:
         print(f"エラー: {exc}", file=sys.stderr)
         return 1
