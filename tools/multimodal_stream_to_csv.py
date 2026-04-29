@@ -1,4 +1,4 @@
-"""OpenPose / eGeMAPS の SSI ストリームを CSV に変換する CLI。"""
+"""OpenPose の SSI ストリームを CSV に変換する CLI。"""
 
 from __future__ import annotations
 
@@ -17,8 +17,6 @@ DEFAULT_OUTPUT_DIR_NAME = "multimodal_csv"
 FLOAT32_BYTE_SIZE = 4
 
 MODALITY_OPENPOSE = "openpose"
-MODALITY_EGEMAPS = "egemaps"
-ALL_MODALITIES = (MODALITY_OPENPOSE, MODALITY_EGEMAPS)
 
 
 @dataclass(frozen=True)
@@ -44,7 +42,6 @@ class ModalitySpec:
     expected_dimension: int
     output_filename: str
     columns: list[str]
-    expected_meta_type: str | None = None
 
 
 @dataclass(frozen=True)
@@ -61,7 +58,7 @@ class ConversionResult:
 def parse_args() -> argparse.Namespace:
     """コマンドライン引数を解析する。"""
     parser = argparse.ArgumentParser(
-        description="OpenPose / eGeMAPS の `.stream` / `.stream~` を CSV に変換します。"
+        description="OpenPose の `.stream` / `.stream~` を CSV に変換します。"
     )
     parser.add_argument(
         "--input-dir",
@@ -71,13 +68,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         help=f"出力先ルート。省略時は `--input-dir/{DEFAULT_OUTPUT_DIR_NAME}` を使います。",
-    )
-    parser.add_argument(
-        "--modalities",
-        nargs="+",
-        choices=ALL_MODALITIES,
-        default=list(ALL_MODALITIES),
-        help="変換するモダリティ。複数指定できます（既定: openpose egemaps）。",
     )
     return parser.parse_args()
 
@@ -113,11 +103,6 @@ def build_openpose_column_names() -> list[str]:
     return columns
 
 
-def build_egemaps_column_names() -> list[str]:
-    """eGeMAPSv02 Functionals 88 次元の列名を生成する。"""
-    return [f"egemaps_{index:03d}" for index in range(88)]
-
-
 def build_modality_specs() -> dict[str, ModalitySpec]:
     """対応モダリティの仕様を返す。"""
     return {
@@ -127,14 +112,6 @@ def build_modality_specs() -> dict[str, ModalitySpec]:
             expected_dimension=139,
             output_filename="novice.openpose.csv",
             columns=build_openpose_column_names(),
-        ),
-        MODALITY_EGEMAPS: ModalitySpec(
-            name=MODALITY_EGEMAPS,
-            stream_name="novice.audio.egemapsv2.stream",
-            expected_dimension=88,
-            output_filename="novice.audio.egemapsv2.csv",
-            columns=build_egemaps_column_names(),
-            expected_meta_type="eGeMAPSv02_Functionals",
         ),
     }
 
@@ -197,12 +174,6 @@ def validate_metadata(metadata: StreamMetadata, spec: ModalitySpec) -> None:
         )
     if metadata.value_type.upper() != "FLOAT":
         raise ValueError(f"未対応の型です: {metadata.value_type}。`type=\"FLOAT\"` を想定しています。")
-    if spec.expected_meta_type is not None and metadata.meta_type != spec.expected_meta_type:
-        raise ValueError(
-            f"{spec.name} の meta type が想定と異なります: "
-            f"{metadata.meta_type}。想定は {spec.expected_meta_type} です。"
-        )
-
 
 def read_and_write_csv(meta_path: Path, data_path: Path, output_path: Path, spec: ModalitySpec) -> tuple[int, int]:
     """1 つの SSI ストリームを CSV に変換する。"""
@@ -258,19 +229,15 @@ def find_subject_dirs(input_dir: Path) -> list[Path]:
 def convert_subject_directory(
     input_dir: Path,
     output_root: Path,
-    modality_names: Iterable[str],
 ) -> tuple[list[ConversionResult], list[tuple[str, Path, str]]]:
-    """被験者ごとに OpenPose / eGeMAPS を CSV に変換する。"""
+    """被験者ごとに OpenPose を CSV に変換する。"""
     specs = build_modality_specs()
-    modality_names = list(modality_names)
-    unknown_modalities = [name for name in modality_names if name not in specs]
-    if unknown_modalities:
-        raise ValueError(f"未対応のモダリティです: {', '.join(unknown_modalities)}")
+    spec = specs[MODALITY_OPENPOSE]
 
     subject_dirs = [
         subject_dir
         for subject_dir in find_subject_dirs(input_dir)
-        if any((subject_dir / specs[modality_name].stream_name).exists() for modality_name in modality_names)
+        if (subject_dir / spec.stream_name).exists()
     ]
     if not subject_dirs:
         raise ValueError(f"`{input_dir}` 配下に対象 stream を含む被験者ディレクトリが見つかりませんでした。")
@@ -278,27 +245,25 @@ def convert_subject_directory(
     results: list[ConversionResult] = []
     failures: list[tuple[str, Path, str]] = []
     for subject_dir in subject_dirs:
-        for modality_name in modality_names:
-            spec = specs[modality_name]
-            meta_path = subject_dir / spec.stream_name
-            data_path = resolve_data_path(meta_path)
-            output_path = output_root / subject_dir.name / spec.output_filename
+        meta_path = subject_dir / spec.stream_name
+        data_path = resolve_data_path(meta_path)
+        output_path = output_root / subject_dir.name / spec.output_filename
 
-            try:
-                frame_count, dimension = read_and_write_csv(meta_path, data_path, output_path, spec)
-            except (FileNotFoundError, ValueError) as exc:
-                failures.append((modality_name, meta_path, str(exc)))
-                continue
+        try:
+            frame_count, dimension = read_and_write_csv(meta_path, data_path, output_path, spec)
+        except (FileNotFoundError, ValueError) as exc:
+            failures.append((MODALITY_OPENPOSE, meta_path, str(exc)))
+            continue
 
-            results.append(
-                ConversionResult(
-                    modality=modality_name,
-                    meta_path=meta_path,
-                    output_path=output_path,
-                    frame_count=frame_count,
-                    dimension=dimension,
-                )
+        results.append(
+            ConversionResult(
+                modality=MODALITY_OPENPOSE,
+                meta_path=meta_path,
+                output_path=output_path,
+                frame_count=frame_count,
+                dimension=dimension,
             )
+        )
 
     return results, failures
 
@@ -325,7 +290,7 @@ def main() -> int:
     output_root = resolve_output_root(input_dir, args.output_dir)
 
     try:
-        results, failures = convert_subject_directory(input_dir, output_root, args.modalities)
+        results, failures = convert_subject_directory(input_dir, output_root)
     except (FileNotFoundError, ValueError) as exc:
         print(f"エラー: {exc}", file=sys.stderr)
         return 1
