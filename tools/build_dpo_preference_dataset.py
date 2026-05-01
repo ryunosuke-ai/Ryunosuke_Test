@@ -27,6 +27,8 @@ DEFAULT_OUTPUT_CSV = "artifacts/noxij_dpo_preferences.csv"
 DEFAULT_FAILED_CSV = "artifacts/noxij_dpo_preferences_failed.csv"
 DEFAULT_MODEL_ID = "Qwen/Qwen3.5-27B"
 DEFAULT_TOP_N = 50
+DEFAULT_DATASET_DIR = "datasets"
+DEFAULT_CONTEXT_TURNS = 4
 DEFAULT_MAX_NEW_TOKENS = 160
 DEFAULT_TEMPERATURE = 0.7
 DEFAULT_TOP_P = 0.8
@@ -57,6 +59,8 @@ DPO_COLUMNS = [
     "final_score",
     "engagement_delta",
     "model_id",
+    "last_novice_text",
+    "context_turn_count",
 ]
 
 FAILED_COLUMNS = [
@@ -68,7 +72,18 @@ FAILED_COLUMNS = [
     "rejected_strategy",
     "final_score",
     "failure_reason",
+    "last_novice_text",
 ]
+
+
+@dataclass(frozen=True)
+class Utterance:
+    """transcript由来の1発話。"""
+
+    speaker: str
+    start_sec: float
+    end_sec: float
+    text: str
 
 
 @dataclass(frozen=True)
@@ -85,6 +100,8 @@ class SourceExample:
     expert_end_sec: float
     novice_start_sec: float
     novice_end_sec: float
+    last_novice_text: str
+    context_utterances: tuple[Utterance, ...]
     raw_row: dict[str, str]
 
 
@@ -118,6 +135,17 @@ class PreferenceExample:
                 "rejected_strategy": self.rejected_strategy,
                 "source_rank": self.source.source_rank,
                 "model_id": self.model_id,
+                "last_novice_text": self.source.last_novice_text,
+                "context_turns": [
+                    {
+                        "speaker": utterance.speaker,
+                        "start_sec": utterance.start_sec,
+                        "end_sec": utterance.end_sec,
+                        "text": utterance.text,
+                    }
+                    for utterance in self.source.context_utterances
+                ],
+                "context_turn_count": len(self.source.context_utterances),
             },
         }
 
@@ -134,6 +162,8 @@ class PreferenceExample:
             "final_score": f"{self.source.final_score:.6f}",
             "engagement_delta": f"{self.source.engagement_delta:.6f}",
             "model_id": self.model_id,
+            "last_novice_text": self.source.last_novice_text,
+            "context_turn_count": str(len(self.source.context_utterances)),
         }
 
 
@@ -157,6 +187,7 @@ class FailedExample:
             "rejected_strategy": self.rejected_strategy,
             "final_score": f"{self.source.final_score:.6f}",
             "failure_reason": self.failure_reason,
+            "last_novice_text": self.source.last_novice_text,
         }
 
 
@@ -189,6 +220,8 @@ def parse_args() -> argparse.Namespace:
         help=f"生成失敗候補 CSV 出力先（既定: {DEFAULT_FAILED_CSV}）。",
     )
     parser.add_argument("--top-n", type=int, default=DEFAULT_TOP_N, help=f"使用する上位候補数（既定: {DEFAULT_TOP_N}）。")
+    parser.add_argument("--dataset-dir", default=DEFAULT_DATASET_DIR, help=f"transcript のルートディレクトリ（既定: {DEFAULT_DATASET_DIR}）。")
+    parser.add_argument("--context-turns", type=int, default=DEFAULT_CONTEXT_TURNS, help=f"promptに含める直前発話数（既定: {DEFAULT_CONTEXT_TURNS}）。")
     parser.add_argument("--min-final-score", type=float, default=None, help="最低 final_score（任意）。")
     parser.add_argument("--model-id", default=os.getenv("LOCAL_QWEN_MODEL_ID", DEFAULT_MODEL_ID), help="QwenモデルID。")
     parser.add_argument("--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS, help="rejected生成の最大トークン数。")
@@ -207,15 +240,83 @@ def normalize_text(text: str) -> str:
 
 def is_setup_or_audio_check(example: SourceExample) -> bool:
     """聞こえ確認や冒頭セットアップに近い候補を除外する。"""
-    prompt = example.prompt
+    prompt = example.last_novice_text
     chosen = example.chosen
     if example.expert_start_sec <= 10.0 and ("聞こえ" in prompt or "聞こえ" in chosen or "初めまして" in chosen):
         return True
     return False
 
 
-def read_source_examples(input_path: Path) -> list[SourceExample]:
+def read_transcript_utterances(path: Path, *, speaker: str) -> list[Utterance]:
+    """transcript annotation CSV を発話リストとして読み込む。"""
+    utterances: list[Utterance] = []
+    with path.open("r", newline="", encoding="utf-8") as file:
+        reader = csv.reader(file, delimiter=";")
+        for row in reader:
+            if len(row) < 3:
+                continue
+            utterances.append(
+                Utterance(
+                    speaker=speaker,
+                    start_sec=float(row[0]),
+                    end_sec=float(row[1]),
+                    text=";".join(row[2:-1] if len(row) > 3 else row[2:]).strip(),
+                )
+            )
+    return utterances
+
+
+def load_session_utterances(dataset_dir: Path, session_id: str) -> list[Utterance]:
+    """1セッションの expert/novice transcript を時系列に統合する。"""
+    session_dir = dataset_dir / session_id
+    utterances = [
+        *read_transcript_utterances(session_dir / "expert.audio.transcript.annotation.csv", speaker="expert"),
+        *read_transcript_utterances(session_dir / "novice.audio.transcript.annotation.csv", speaker="novice"),
+    ]
+    return sorted(utterances, key=lambda item: (item.start_sec, item.end_sec, item.speaker))
+
+
+def build_context_utterances(
+    utterances: list[Utterance],
+    *,
+    expert_start_sec: float,
+    context_turns: int,
+) -> tuple[Utterance, ...]:
+    """chosen expert 発話直前の文脈発話を返す。"""
+    previous = [
+        utterance
+        for utterance in utterances
+        if utterance.start_sec < expert_start_sec
+    ]
+    return tuple(previous[-context_turns:])
+
+
+def format_context_prompt(context_utterances: tuple[Utterance, ...]) -> str:
+    """DPO prompt 用に文脈発話を整形する。"""
+    lines = ["これまでの会話:"]
+    for utterance in context_utterances:
+        lines.append(f"{utterance.speaker}: {utterance.text}")
+    lines.extend(["", "次のexpert返答を作ってください。"])
+    return "\n".join(lines)
+
+
+def last_novice_text_from_context(context_utterances: tuple[Utterance, ...], fallback: str) -> str:
+    """文脈内の最後の novice 発話を返す。"""
+    for utterance in reversed(context_utterances):
+        if utterance.speaker == "novice":
+            return utterance.text
+    return fallback
+
+
+def read_source_examples(
+    input_path: Path,
+    *,
+    dataset_dir: Path = Path(DEFAULT_DATASET_DIR),
+    context_turns: int = DEFAULT_CONTEXT_TURNS,
+) -> list[SourceExample]:
     """multimodal score CSV を読み込む。"""
+    if context_turns <= 0:
+        raise ValueError("`context_turns` は 1 以上を指定してください。")
     try:
         with input_path.open("r", newline="", encoding="utf-8") as file:
             rows = list(csv.DictReader(file))
@@ -223,20 +324,34 @@ def read_source_examples(input_path: Path) -> list[SourceExample]:
         raise FileNotFoundError(f"入力CSVが見つかりません: {input_path}") from exc
 
     examples: list[SourceExample] = []
+    utterance_cache: dict[str, list[Utterance]] = {}
     for rank, row in enumerate(rows, start=1):
         try:
+            session_id = row["session_id"]
+            if session_id not in utterance_cache:
+                utterance_cache[session_id] = load_session_utterances(dataset_dir, session_id)
+            expert_start_sec = float(row["expert_start_sec"])
+            context_utterances = build_context_utterances(
+                utterance_cache[session_id],
+                expert_start_sec=expert_start_sec,
+                context_turns=context_turns,
+            )
+            raw_novice_text = row["novice_text"].strip()
+            last_novice_text = last_novice_text_from_context(context_utterances, raw_novice_text)
             examples.append(
                 SourceExample(
                     source_rank=rank,
-                    session_id=row["session_id"],
-                    prompt=row["novice_text"].strip(),
+                    session_id=session_id,
+                    prompt=format_context_prompt(context_utterances),
                     chosen=row["expert_text"].strip(),
                     final_score=float(row["final_score"]),
                     engagement_delta=float(row["engagement_delta"]),
-                    expert_start_sec=float(row["expert_start_sec"]),
+                    expert_start_sec=expert_start_sec,
                     expert_end_sec=float(row["expert_end_sec"]),
                     novice_start_sec=float(row["novice_start_sec"]),
                     novice_end_sec=float(row["novice_end_sec"]),
+                    last_novice_text=last_novice_text,
+                    context_utterances=context_utterances,
                     raw_row=row,
                 )
             )
@@ -309,12 +424,20 @@ def build_generation_messages(example: SourceExample, prompt_type: str, strategy
         "あなたはDPO学習用データを作る日本語会話データ作成者です。"
         "目的は、自然だがchosenより会話意欲を少し下げるrejected返答を1つ作ることです。"
         "暴言、攻撃、差別、倫理的に問題のある内容、露骨に失礼な返答は禁止です。"
+        "会話分析やメタ説明ではなく、次のexpertの発話本文だけを作ってください。"
         "出力はJSONのみで、キーは rejected だけにしてください。"
     )
-    user = f"""以下の会話候補から rejected を作成してください。
+    conversation_context = "\n".join(
+        f"{utterance.speaker}: {utterance.text}"
+        for utterance in example.context_utterances
+    )
+    user = f"""以下の会話文脈から、次のexpert返答として rejected を作成してください。
 
-prompt（novice発話）:
-{example.prompt}
+conversation_context:
+{conversation_context}
+
+last_novice_utterance:
+{example.last_novice_text}
 
 chosen（実際に反応が良かったexpert返答）:
 {example.chosen}
@@ -325,11 +448,15 @@ rejected_strategy: {strategy}
 条件:
 - 日本語の1文または2文にする。
 - 実際の会話であり得る自然な返答にする。
+- 文脈上、次にexpertが返す1発話だけを作る。
+- last_novice_utterance への返答として自然にする。
 - ただし chosen よりも、相手が話し続けにくくなる返答にする。
-- prompt の具体語を拾いすぎない。
+- last_novice_utterance の具体語を拾いすぎない。
 - 共感、深掘り、言い換え、促しのうち少なくとも1つを欠かす。
-- chosen や prompt をコピーしない。
+- chosen や last_novice_utterance をコピーしない。
 - chosen と同程度か、少し短めにする。
+- 会話分析やメタ説明をしない。
+- expert: や novice: などの話者ラベルを出力しない。
 - 説明や分析を出さず、JSONだけを返す。
 
 出力形式:
@@ -369,16 +496,31 @@ def is_too_similar(first: str, second: str) -> bool:
 
 def validate_rejected(example: SourceExample, rejected: str) -> tuple[bool, str]:
     """生成された rejected の最低限の品質を検査する。"""
+    forbidden_phrases = (
+        "返答",
+        "意欲",
+        "示しています",
+        "会話",
+        "何が言いたかったんですか",
+        "終わりにしましょう",
+        "またの機会",
+        "expert:",
+        "novice:",
+        "Expert:",
+        "Novice:",
+    )
     if not rejected:
         return False, "rejectedが空です"
     if is_too_similar(example.chosen, rejected):
         return False, "chosenと近すぎます"
-    if is_too_similar(example.prompt, rejected):
-        return False, "promptと近すぎます"
+    if is_too_similar(example.last_novice_text, rejected):
+        return False, "last_novice_textと近すぎます"
     if len(rejected) > max(180, int(len(example.chosen) * 1.4)):
         return False, "rejectedが長すぎます"
     if any(marker in rejected for marker in ("```", "rejected", "prompt", "chosen")):
         return False, "JSONや説明文が混入しています"
+    if any(phrase in rejected for phrase in forbidden_phrases):
+        return False, "会話返答ではない表現または強すぎる表現が含まれています"
     return True, ""
 
 
@@ -475,7 +617,7 @@ def generate_preference_for_example(
     rng: random.Random,
 ) -> PreferenceExample | FailedExample:
     """1候補から preference 例を生成する。"""
-    prompt_type = classify_prompt_type(example.prompt)
+    prompt_type = classify_prompt_type(example.last_novice_text)
     strategy = choose_rejected_strategy(prompt_type, rng)
     messages = build_generation_messages(example, prompt_type, strategy)
     last_reason = "生成されませんでした"
@@ -555,12 +697,14 @@ def print_dry_run_summary(examples: list[SourceExample]) -> None:
     """dry-run 用に候補概要を表示する。"""
     print(f"{len(examples)} 件の候補を選択しました。")
     for example in examples[:10]:
-        prompt_type = classify_prompt_type(example.prompt)
+        prompt_type = classify_prompt_type(example.last_novice_text)
         print(
             f"rank={example.source_rank} session={example.session_id} "
             f"score={example.final_score:.6f} prompt_type={prompt_type} "
-            f"prompt={example.prompt[:60]!r} chosen={example.chosen[:60]!r}"
+            f"context_turns={len(example.context_utterances)} "
+            f"last_novice={example.last_novice_text[:60]!r} chosen={example.chosen[:60]!r}"
         )
+        print(example.prompt[:240].replace("\n", " / "))
 
 
 def main() -> int:
@@ -568,7 +712,11 @@ def main() -> int:
     args = parse_args()
     rng = random.Random(args.seed)
     try:
-        sources = read_source_examples(Path(args.input))
+        sources = read_source_examples(
+            Path(args.input),
+            dataset_dir=Path(args.dataset_dir),
+            context_turns=args.context_turns,
+        )
         selected_sources = select_source_examples(
             sources,
             top_n=args.top_n,

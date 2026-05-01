@@ -8,9 +8,11 @@ from pathlib import Path
 from tools.build_dpo_preference_dataset import (
     PreferenceExample,
     SourceExample,
+    Utterance,
     build_generation_messages,
     classify_prompt_type,
     extract_rejected_text,
+    format_context_prompt,
     generate_preference_for_example,
     read_source_examples,
     select_source_examples,
@@ -42,10 +44,14 @@ def make_source(
     final_score: float = 0.8,
     expert_start_sec: float = 20.0,
 ) -> SourceExample:
+    context = (
+        Utterance("expert", 10.0, 12.0, "旅行の話をしましょう。"),
+        Utterance("novice", 17.0, 19.0, prompt),
+    )
     return SourceExample(
         source_rank=rank,
         session_id="001",
-        prompt=prompt,
+        prompt=format_context_prompt(context),
         chosen=chosen,
         final_score=final_score,
         engagement_delta=0.1,
@@ -53,6 +59,8 @@ def make_source(
         expert_end_sec=expert_start_sec + 5.0,
         novice_start_sec=expert_start_sec - 3.0,
         novice_end_sec=expert_start_sec - 1.0,
+        last_novice_text=prompt,
+        context_utterances=context,
         raw_row={},
     )
 
@@ -110,13 +118,71 @@ def write_score_csv(path: Path) -> None:
         writer.writerows(rows)
 
 
+def write_transcript(path: Path, rows: list[tuple[float, float, str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.writer(file, delimiter=";")
+        for start, end, text in rows:
+            writer.writerow([start, end, text, "0.00"])
+
+
+def write_dataset_transcripts(dataset_dir: Path) -> None:
+    write_transcript(
+        dataset_dir / "001" / "expert.audio.transcript.annotation.csv",
+        [
+            (5.0, 8.0, "はい、聞こえてます。初めまして。"),
+            (10.0, 12.0, "旅行の話をしましょう。"),
+            (20.0, 25.0, "はい、移動時間も含めて楽しむタイプなんです。"),
+        ],
+    )
+    write_transcript(
+        dataset_dir / "001" / "novice.audio.transcript.annotation.csv",
+        [
+            (1.0, 4.0, "聞こえてますか?"),
+            (16.0, 19.0, "旅行は好きなんですか?"),
+        ],
+    )
+    write_transcript(
+        dataset_dir / "002" / "expert.audio.transcript.annotation.csv",
+        [
+            (22.0, 24.0, "投資の話をしています。"),
+            (30.0, 35.0, "難しかったら身近な例で言い直しますね。"),
+        ],
+    )
+    write_transcript(
+        dataset_dir / "002" / "novice.audio.transcript.annotation.csv",
+        [
+            (27.0, 29.0, "ちょっと難しいですね。"),
+        ],
+    )
+
+
 def test_select_source_examples_skips_setup_rows(tmp_path: Path):
     path = tmp_path / "score.csv"
+    dataset_dir = tmp_path / "datasets"
     write_score_csv(path)
+    write_dataset_transcripts(dataset_dir)
 
-    examples = select_source_examples(read_source_examples(path), top_n=2)
+    examples = select_source_examples(read_source_examples(path, dataset_dir=dataset_dir), top_n=2)
 
     assert [example.source_rank for example in examples] == [2, 3]
+
+
+def test_read_source_examples_builds_context_prompt_without_target_chosen(tmp_path: Path):
+    path = tmp_path / "score.csv"
+    dataset_dir = tmp_path / "datasets"
+    write_score_csv(path)
+    write_dataset_transcripts(dataset_dir)
+
+    examples = read_source_examples(path, dataset_dir=dataset_dir, context_turns=4)
+    example = examples[1]
+
+    assert "これまでの会話:" in example.prompt
+    assert "expert: 旅行の話をしましょう。" in example.prompt
+    assert "novice: 旅行は好きなんですか?" in example.prompt
+    assert "はい、移動時間も含めて楽しむタイプなんです。" not in example.prompt
+    assert example.last_novice_text == "旅行は好きなんですか?"
+    assert len(example.context_utterances) == 4
 
 
 def test_classify_prompt_type():
@@ -134,6 +200,8 @@ def test_build_generation_messages_contains_constraints():
 
     assert "JSON" in joined
     assert "暴言" in joined
+    assert "conversation_context" in joined
+    assert "last_novice_utterance" in joined
     assert "chosen よりも、相手が話し続けにくくなる" in joined
 
 
@@ -150,6 +218,15 @@ def test_validate_rejected_rejects_duplicates():
 
     assert valid is False
     assert "chosen" in reason
+
+
+def test_validate_rejected_rejects_meta_language():
+    source = make_source()
+
+    valid, reason = validate_rejected(source, "はいはいはいという返答は、相手が話したい意欲があることを示しています。")
+
+    assert valid is False
+    assert "会話返答ではない" in reason
 
 
 def test_generate_preference_for_example_retries_until_valid():
@@ -187,6 +264,9 @@ def test_write_jsonl_and_csv_files(tmp_path: Path):
     record = json.loads(jsonl_path.read_text(encoding="utf-8").strip())
     assert record["prompt"] == source.prompt
     assert record["metadata"]["source_rank"] == 1
+    assert record["metadata"]["last_novice_text"] == source.last_novice_text
+    assert record["metadata"]["context_turn_count"] == 2
     with csv_path.open("r", newline="", encoding="utf-8") as file:
         rows = list(csv.DictReader(file))
     assert rows[0]["rejected"] == "旅行は気分転換になりますよね。"
+    assert rows[0]["last_novice_text"] == source.last_novice_text
