@@ -215,6 +215,25 @@ def build_lora_config(args: argparse.Namespace, deps: dict[str, Any]):
     )
 
 
+def disable_peft_bitsandbytes_dispatch() -> None:
+    """PEFTのLoRA挿入時にbitsandbytes backendを使わせない。"""
+    try:
+        import peft.import_utils as peft_import_utils
+        import peft.tuners.lora.model as peft_lora_model
+    except ImportError:
+        return
+
+    def _always_false() -> bool:
+        return False
+
+    for module in (peft_import_utils, peft_lora_model):
+        for name in ("is_bnb_available", "is_bnb_4bit_available"):
+            detector = getattr(module, name, None)
+            if hasattr(detector, "cache_clear"):
+                detector.cache_clear()
+            setattr(module, name, _always_false)
+
+
 def build_training_args(args: argparse.Namespace, deps: dict[str, Any], *, dtype: Any, has_eval: bool):
     """TRL DPOConfig を作成する。"""
     torch = deps["torch"]
@@ -256,6 +275,8 @@ def build_training_args(args: argparse.Namespace, deps: dict[str, Any], *, dtype
 def train(args: argparse.Namespace, split: PreferenceDatasetSplit) -> None:
     """DPO LoRA学習を実行する。"""
     deps = load_training_dependencies()
+    if args.no_4bit:
+        disable_peft_bitsandbytes_dispatch()
     tokenizer = load_tokenizer(args.model_id, deps)
     model, dtype = load_model(args, deps)
     lora_config = build_lora_config(args, deps)

@@ -8,6 +8,7 @@ import pytest
 
 from tools.train_qwen35_dpo_lora import (
     PreferenceDatasetSplit,
+    disable_peft_bitsandbytes_dispatch,
     print_dry_run_summary,
     read_preference_records,
     split_records,
@@ -113,3 +114,18 @@ def test_print_dry_run_summary_outputs_core_settings(capsys):
     assert "DPO LoRA dry-run" in output
     assert "Qwen/Qwen3.5-27B" in output
     assert "train/eval: 1 / 0" in output
+
+
+def test_disable_peft_bitsandbytes_dispatch_forces_detectors_false():
+    try:
+        import peft.import_utils as peft_import_utils
+        import peft.tuners.lora.model as peft_lora_model
+    except ImportError:
+        pytest.skip("peft がインストールされていません")
+
+    disable_peft_bitsandbytes_dispatch()
+
+    assert peft_import_utils.is_bnb_available() is False
+    assert peft_import_utils.is_bnb_4bit_available() is False
+    assert peft_lora_model.is_bnb_available() is False
+    assert peft_lora_model.is_bnb_4bit_available() is False
