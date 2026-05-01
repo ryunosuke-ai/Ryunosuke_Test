@@ -11,6 +11,8 @@ from tools.build_dpo_preference_dataset import (
     Utterance,
     build_generation_messages,
     classify_prompt_type,
+    convert_jsonl_to_ai_user,
+    convert_record_to_ai_user,
     extract_rejected_text,
     format_context_prompt,
     generate_preference_for_example,
@@ -270,3 +272,55 @@ def test_write_jsonl_and_csv_files(tmp_path: Path):
         rows = list(csv.DictReader(file))
     assert rows[0]["rejected"] == "旅行は気分転換になりますよね。"
     assert rows[0]["last_novice_text"] == source.last_novice_text
+
+
+def test_convert_record_to_ai_user_rewrites_prompt_and_metadata():
+    source = make_source()
+    example = PreferenceExample(
+        prompt=source.prompt,
+        chosen=source.chosen,
+        rejected="旅行は気分転換になりますよね。",
+        prompt_type="question",
+        rejected_strategy="内容を拾わない一般論",
+        source=source,
+        model_id="stub-qwen",
+    )
+    record = example.to_jsonl_record()
+
+    converted = convert_record_to_ai_user(record)
+
+    assert converted["chosen"] == record["chosen"]
+    assert converted["rejected"] == record["rejected"]
+    assert converted["prompt"].startswith("以下の会話の次のAI返答を生成してください。")
+    assert "AI: 旅行の話をしましょう。" in converted["prompt"]
+    assert "User: 神奈川に行ったのは何かの聖地なんですか?" in converted["prompt"]
+    assert converted["prompt"].endswith("\nAI:")
+    assert "expert:" not in converted["prompt"]
+    assert "novice:" not in converted["prompt"]
+    assert "次のexpert返答" not in converted["prompt"]
+    assert converted["metadata"]["context_turns"][0]["speaker"] == "AI"
+    assert converted["metadata"]["context_turns"][1]["speaker"] == "User"
+
+
+def test_convert_jsonl_to_ai_user_writes_all_records(tmp_path: Path):
+    source = make_source()
+    example = PreferenceExample(
+        prompt=source.prompt,
+        chosen=source.chosen,
+        rejected="旅行は気分転換になりますよね。",
+        prompt_type="question",
+        rejected_strategy="内容を拾わない一般論",
+        source=source,
+        model_id="stub-qwen",
+    )
+    input_path = tmp_path / "input.jsonl"
+    output_path = tmp_path / "output.jsonl"
+    write_jsonl([example, example], input_path)
+
+    count = convert_jsonl_to_ai_user(input_path, output_path)
+
+    rows = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
+    assert count == 2
+    assert len(rows) == 2
+    assert all(row["prompt"].endswith("\nAI:") for row in rows)
+    assert all(row["chosen"] == source.chosen for row in rows)

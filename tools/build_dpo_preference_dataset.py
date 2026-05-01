@@ -23,6 +23,7 @@ from core.local_llm_utils import build_qwen_generation_prompt, extract_qwen_fina
 
 DEFAULT_INPUT_PATH = "artifacts/noxij_dpo_multimodal_score.csv"
 DEFAULT_OUTPUT_JSONL = "artifacts/noxij_dpo_preferences.jsonl"
+DEFAULT_AI_USER_OUTPUT_JSONL = "artifacts/noxij_dpo_preferences_ai_user.jsonl"
 DEFAULT_OUTPUT_CSV = "artifacts/noxij_dpo_preferences.csv"
 DEFAULT_FAILED_CSV = "artifacts/noxij_dpo_preferences_failed.csv"
 DEFAULT_MODEL_ID = "Qwen/Qwen3.5-27B"
@@ -230,6 +231,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="乱数シード。")
     parser.add_argument("--dry-run", action="store_true", help="モデルを読まず、候補選定結果だけ表示します。")
     parser.add_argument("--resume", action="store_true", help="既存JSONLの source_rank をスキップして再開します。")
+    parser.add_argument(
+        "--convert-ai-user-jsonl",
+        action="store_true",
+        help="既存DPO JSONLをAI/User表記のpromptへ変換して終了します。",
+    )
+    parser.add_argument(
+        "--preference-jsonl-input",
+        default=DEFAULT_OUTPUT_JSONL,
+        help=f"AI/User変換元のDPO JSONL（既定: {DEFAULT_OUTPUT_JSONL}）。",
+    )
+    parser.add_argument(
+        "--ai-user-output-jsonl",
+        default=DEFAULT_AI_USER_OUTPUT_JSONL,
+        help=f"AI/User変換後のDPO JSONL出力先（既定: {DEFAULT_AI_USER_OUTPUT_JSONL}）。",
+    )
     return parser.parse_args()
 
 
@@ -298,6 +314,62 @@ def format_context_prompt(context_utterances: tuple[Utterance, ...]) -> str:
         lines.append(f"{utterance.speaker}: {utterance.text}")
     lines.extend(["", "次のexpert返答を作ってください。"])
     return "\n".join(lines)
+
+
+def to_ai_user_speaker(speaker: str) -> str:
+    """NoXiの話者名を評価用のAI/User表記に変換する。"""
+    if speaker == "expert":
+        return "AI"
+    if speaker == "novice":
+        return "User"
+    return speaker
+
+
+def format_ai_user_prompt(context_turns: list[dict[str, object]]) -> str:
+    """AI/User形式のDPO promptを作成する。"""
+    lines = [
+        "以下の会話の次のAI返答を生成してください。",
+        "",
+        "これまでの会話:",
+    ]
+    for turn in context_turns:
+        speaker = to_ai_user_speaker(str(turn.get("speaker", "")))
+        text = str(turn.get("text", "")).strip()
+        lines.append(f"{speaker}: {text}")
+    lines.extend(["", "AI:"])
+    return "\n".join(lines)
+
+
+def convert_record_to_ai_user(record: dict) -> dict:
+    """DPO JSONLの1レコードをAI/User prompt形式へ変換する。"""
+    converted = dict(record)
+    metadata = dict(converted.get("metadata", {}))
+    context_turns = [
+        {
+            **turn,
+            "speaker": to_ai_user_speaker(str(turn.get("speaker", ""))),
+        }
+        for turn in metadata.get("context_turns", [])
+    ]
+    metadata["context_turns"] = context_turns
+    converted["metadata"] = metadata
+    converted["prompt"] = format_ai_user_prompt(context_turns)
+    return converted
+
+
+def convert_jsonl_to_ai_user(input_path: Path, output_path: Path) -> int:
+    """既存DPO JSONLをAI/User prompt形式へ変換する。"""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    count = 0
+    with input_path.open("r", encoding="utf-8") as input_file, output_path.open("w", encoding="utf-8") as output_file:
+        for line in input_file:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            converted = convert_record_to_ai_user(record)
+            output_file.write(json.dumps(converted, ensure_ascii=False) + "\n")
+            count += 1
+    return count
 
 
 def last_novice_text_from_context(context_utterances: tuple[Utterance, ...], fallback: str) -> str:
@@ -710,6 +782,18 @@ def print_dry_run_summary(examples: list[SourceExample]) -> None:
 def main() -> int:
     """CLIエントリポイント。"""
     args = parse_args()
+    if args.convert_ai_user_jsonl:
+        try:
+            count = convert_jsonl_to_ai_user(
+                Path(args.preference_jsonl_input),
+                Path(args.ai_user_output_jsonl),
+            )
+        except (FileNotFoundError, json.JSONDecodeError) as exc:
+            print(f"エラー: AI/User変換に失敗しました: {exc}", file=sys.stderr)
+            return 1
+        print(f"AI/User DPO JSONL: {args.ai_user_output_jsonl} ({count} 件)")
+        return 0
+
     rng = random.Random(args.seed)
     try:
         sources = read_source_examples(
