@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import logging
+from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -53,6 +55,57 @@ class ChatBundle:
 def read_env_value(name: str, default: str) -> str:
     """環境変数から設定値を読む。"""
     return os.getenv(name, default).strip() or default
+
+
+def create_run_dir() -> tuple[str, str]:
+    """会話ログ保存用のrunディレクトリと履歴ファイルを作る。"""
+    os.makedirs("logs", exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = f"logs/run_{ts}"
+    os.makedirs(run_dir, exist_ok=True)
+    history_file = f"{run_dir}/log_{ts}.txt"
+    return run_dir, history_file
+
+
+def append_history_line(history_file: str, role: str, text: str) -> None:
+    """履歴ファイルへ1行追記する。"""
+    safe_text = str(text).replace("\n", " ").strip()
+    if not safe_text:
+        return
+    with open(history_file, "a", encoding="utf-8") as file:
+        file.write(f"[{datetime.now().strftime('%H:%M:%S')}] {role}: {safe_text}\n")
+
+
+def write_session_header(history_file: str, *, base_model_id: str, lora_path: str, use_4bit: bool, args: argparse.Namespace) -> None:
+    """履歴ファイルの先頭にセッション情報を残す。"""
+    with open(history_file, "a", encoding="utf-8") as file:
+        file.write(f"# session_start: {datetime.now().isoformat(timespec='seconds')}\n")
+        file.write(f"# base_model_id: {base_model_id}\n")
+        file.write(f"# lora_path: {lora_path}\n")
+        file.write(f"# use_4bit: {use_4bit}\n")
+        file.write(f"# max_new_tokens: {args.max_new_tokens}\n")
+        file.write(f"# temperature: {args.temperature}\n")
+        file.write(f"# top_p: {args.top_p}\n")
+        file.write(f"# repetition_penalty: {args.repetition_penalty}\n")
+        file.write(f"# seed: {args.seed}\n")
+        file.write("\n")
+
+
+def setup_logger(run_dir: str, timestamp: str) -> logging.Logger:
+    """会話ログをファイルへ残すロガーを作る。"""
+    logger = logging.getLogger("dpo_text_chat")
+    logger.setLevel(logging.INFO)
+    formatter = logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s", "%H:%M:%S")
+
+    file_handler = logging.FileHandler(f"{run_dir}/agent_{timestamp}.log", encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(formatter)
+
+    logger.handlers.clear()
+    logger.addHandler(file_handler)
+    logger.addHandler(stream_handler)
+    return logger
 
 
 def parse_args() -> argparse.Namespace:
@@ -269,6 +322,16 @@ def run_repl() -> int:
     """ターミナル対話ループを実行する。"""
     args = parse_args()
     try:
+        run_dir, history_file = create_run_dir()
+        timestamp = Path(history_file).stem.replace("log_", "")
+        logger = setup_logger(run_dir, timestamp)
+        write_session_header(
+            history_file,
+            base_model_id=args.base_model_id,
+            lora_path=args.lora_path,
+            use_4bit=args.use_4bit,
+            args=args,
+        )
         bundle = load_chat_bundle(args.base_model_id, args.lora_path, no_4bit=not args.use_4bit)
     except RuntimeError as exc:
         print(f"エラー: {exc}", file=sys.stderr)
@@ -278,7 +341,12 @@ def run_repl() -> int:
     print(f"  ベースモデル: {args.base_model_id}")
     print(f"  LoRA adapter : {args.lora_path}")
     print(f"  4bit         : {'有効' if args.use_4bit else '無効'}")
+    print(f"  ログ出力先   : {run_dir}/")
     print()
+    logger.info("会話ログ: %s", history_file)
+    logger.info("ベースモデル: %s", args.base_model_id)
+    logger.info("LoRA adapter: %s", args.lora_path)
+    logger.info("4bit: %s", "有効" if args.use_4bit else "無効")
 
     while True:
         try:
@@ -295,6 +363,9 @@ def run_repl() -> int:
         if user_text.lower() in {"exit", "quit", ":q"}:
             break
 
+        append_history_line(history_file, "User", user_text)
+        logger.info("User: %s", user_text)
+
         try:
             reply = generate_reply(
                 bundle,
@@ -307,10 +378,15 @@ def run_repl() -> int:
             )
         except Exception as exc:
             print(f"AI: 生成に失敗しました: {exc}")
+            logger.warning("生成失敗: %s", exc)
             continue
 
-        print(f"AI: {reply or '（空の返答）'}")
+        final_reply = reply or "（空の返答）"
+        print(f"AI: {final_reply}")
+        append_history_line(history_file, "AI", final_reply)
+        logger.info("AI: %s", final_reply)
 
+    print(f"\n会話ログを保存しました: {run_dir}/")
     return 0
 
 
